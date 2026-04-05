@@ -481,6 +481,50 @@ delete_node() {
 }
 
 # ============================================
+#  修改节点端口
+# ============================================
+
+modify_port() {
+    if [ ! -f "$NODES_DB" ] || [ ! -s "$NODES_DB" ]; then
+        warn "暂无节点"
+        return
+    fi
+
+    list_nodes
+    echo ""
+    read -p "输入要修改的节点编号: " num
+
+    local total=$(wc -l < "$NODES_DB")
+    if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt "$total" ]; then
+        err "无效编号"
+        return
+    fi
+
+    local line=$(sed -n "${num}p" "$NODES_DB")
+    local old_port=$(echo "$line" | cut -d'|' -f2)
+    local remark=$(echo "$line" | cut -d'|' -f9)
+    [ -z "$remark" ] && remark=$(echo "$line" | cut -d'|' -f5)
+
+    echo ""
+    msg "当前端口: $old_port ($remark)"
+    local new_port=$(read_port)
+
+    # 关闭旧端口防火墙
+    close_firewall "$old_port"
+
+    # 替换 nodes.txt 中的端口（第2个字段）
+    sed -i "${num}s/^[^|]*|[^|]*/$(echo "$line" | cut -d'|' -f1)|${new_port}/" "$NODES_DB"
+
+    # 重建配置 + 开放新端口防火墙 + 重启
+    rebuild_config
+    open_firewall "$new_port"
+    restart_xray
+
+    echo ""
+    msg "端口已修改: $old_port → $new_port ($remark)"
+}
+
+# ============================================
 #  导出所有节点链接
 # ============================================
 
@@ -592,19 +636,21 @@ show_menu() {
     echo -e "  ${B}2.${N} 添加 Shadowsocks 节点"
     echo -e "  ${B}3.${N} 查看所有节点"
     echo -e "  ${B}4.${N} 删除节点"
-    echo -e "  ${B}5.${N} 导出所有链接"
-    echo -e "  ${B}6.${N} 卸载 (清空所有数据)"
+    echo -e "  ${B}5.${N} 修改节点端口"
+    echo -e "  ${B}6.${N} 导出所有链接"
+    echo -e "  ${B}7.${N} 卸载 (清空所有数据)"
     echo -e "  ${B}0.${N} 退出"
     echo ""
-    read -p "请选择 [0-6]: " choice
+    read -p "请选择 [0-7]: " choice
 
     case $choice in
         1) add_vless ;;
         2) add_ss ;;
         3) list_nodes ;;
         4) delete_node ;;
-        5) export_links ;;
-        6) uninstall ;;
+        5) modify_port ;;
+        6) export_links ;;
+        7) uninstall ;;
         0) echo -e "\n再见！"; exit 0 ;;
         *) warn "无效选择" ;;
     esac
