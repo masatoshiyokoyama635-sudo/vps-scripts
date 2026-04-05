@@ -1,16 +1,23 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================
-#   Xray 节点管理脚本
+#   Xray 节点管理脚本 (多系统兼容版)
+#   支持: Ubuntu/Debian, Alpine, CentOS/Rocky
 #   支持: VLESS+Reality+TCP / Shadowsocks
+#   支持: NAT 小鸡
 # ============================================
 
 # ---- 配置 ----
 XRAY_CONF="/usr/local/etc/xray/config.json"
 NODES_DB="/usr/local/etc/xray/nodes.txt"
 PUBLIC_IP=""
-
-# 重要端口黑名单（不随机分配）
+NAT_MODE=false
+EXTERNAL_IP=""
 BLOCKED_PORTS="22 53 80 443 445 993 995 3389 5900 8080 8443 8888"
+
+# 系统检测变量（由 detect_os 填充）
+PKG_MANAGER=""
+SERVICE_CMD=""       # systemctl / rc-service
+SVC_TYPE=""          # systemd / openrc
 
 # ---- 颜色 ----
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[0;33m'
@@ -21,41 +28,154 @@ warn() { echo -e "${Y}[!]${N} $1" >&2; }
 err()  { echo -e "${R}[×]${N} $1" >&2; }
 
 # ============================================
-#  工具函数
+#  系统检测
 # ============================================
+
+detect_os() {
+    # 检测包管理器
+    if command -v apt &>/dev/null; then
+        PKG_MANAGER="apt"
+    elif command -v apk &>/dev/null; then
+        PKG_MANAGER="apk"
+    elif command -v dnf &>/dev/null; then
+        PKG_MANAGER="dnf"
+    elif command -v yum &>/dev/null; then
+        PKG_MANAGER="yum"
+    else
+        err "不支持的系统，未找到包管理器 (apt/apk/dnf/yum)"
+        exit 1
+    fi
+    msg "包管理器: $PKG_MANAGER"
+
+    # 检测服务管理
+    if command -v systemctl &>/dev/null; then
+        SVC_TYPE="systemd"
+        SERVICE_CMD="systemctl"
+    elif command -v rc-service &>/dev/null; then
+        SVC_TYPE="openrc"
+        SERVICE_CMD="rc-service"
+    else
+        SVC_TYPE="raw"
+        SERVICE_CMD=""
+        warn "未检测到服务管理器 (systemd/openrc)，将使用手动管理"
+    fi
+    msg "服务管理: ${SVC_TYPE}"
+
+    # 检测公网 IP / NAT 模式
+    PUBLIC_IP=$(curl -s --connect-timeout 5 api.ipify.org 2>/dev/null || \
+                curl -s --connect-timeout 5 ipv4.icanhazip.com 2>/dev/null)
+    if [ -z "$PUBLIC_IP" ]; then
+        NAT_MODE=true
+        warn "未检测到公网 IPv4，进入 NAT 模式"
+    else
+        msg "公网 IP: $PUBLIC_IP"
+    fi
+}
+
+# ============================================
+#  依赖安装
+# ============================================
+
+pkg_install() {
+    case "$PKG_MANAGER" in
+        apt) apt update && apt install -y "$@" ;;
+        apk) apk add --no-cache "$@" ;;
+        dnf) dnf install -y "$@" ;;
+        yum) yum install -y "$@" ;;
+    esac
+}
 
 check_deps() {
     local need=()
+
+    # Alpine 需要先装 bash
+    if [ "$PKG_MANAGER" = "apk" ] && ! command -v bash &>/dev/null; then
+        msg "Alpine: 安装 bash..."
+        apk add --no-cache bash
+    fi
+
     command -v jq &>/dev/null      || need+=(jq)
     command -v openssl &>/dev/null || need+=(openssl)
+
     if [ ${#need[@]} -gt 0 ]; then
         read -p "缺少依赖: ${need[*]}，是否安装? [y/N] " yn
         [[ "$yn" =~ ^[Yy]$ ]] || exit 1
-        apt update && apt install -y "${need[@]}"
+        pkg_install "${need[@]}"
     fi
+
     if ! command -v xray &>/dev/null; then
         read -p "未检测到 Xray，是否安装? [y/N] " yn
         [[ "$yn" =~ ^[Yy]$ ]] || exit 1
         bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh) install
+        setup_xray_service
     fi
-    PUBLIC_IP=$(curl -s --connect-timeout 5 api.ipify.org 2>/dev/null || curl -s --connect-timeout 5 ipv4.icanhazip.com 2>/dev/null || curl -s --connect-timeout 5 -4 ip.sb 2>/dev/null)
+
     mkdir -p /usr/local/etc/xray
 }
 
+# ============================================
+#  Xray 服务管理（多系统适配）
+# ============================================
+
+setup_xray_service() {
+    if [ "$SVC_TYPE" = "openrc" ]; then
+        # Alpine / OpenRC: 创建 init.d 脚本
+        if [ ! -f /etc/init.d/xray ]; then
+            msg "创建 OpenRC 服务..."
+            printf '#!/sbin/openrc-run\n\ncommand="/usr/local/bin/xray"\ncommand_args="run -config /usr/local/etc/xray/config.json"\ncommand_background=true\npidfile="/run/xray.pid"\n' > /etc/init.d/xray
+            chmod +x /etc/init.d/xray
+            rc-update add xray default 2>/dev/null
+        fi
+    fi
+    # systemd: xray 安装脚本已自动创建 service，不需要额外处理
+}
+
+svc_restart() {
+    case "$SVC_TYPE" in
+        systemd) systemctl restart xray ;;
+        openrc)  rc-service xray restart ;;
+        *)       pkill xray 2>/dev/null; sleep 1; xray run -config "$XRAY_CONF" &>/dev/null & ;;
+    esac
+}
+
+svc_stop() {
+    case "$SVC_TYPE" in
+        systemd) systemctl stop xray 2>/dev/null ;;
+        openrc)  rc-service xray stop 2>/dev/null ;;
+        *)       pkill xray 2>/dev/null ;;
+    esac
+}
+
+svc_disable() {
+    case "$SVC_TYPE" in
+        systemd) systemctl disable xray 2>/dev/null ;;
+        openrc)  rc-update del xray default 2>/dev/null ;;
+    esac
+}
+
+restart_xray() {
+    svc_restart && msg "Xray 已重启" || err "Xray 重启失败"
+}
+
+# ============================================
+#  工具函数
+# ============================================
+
 port_used() { ss -tlnp 2>/dev/null | grep -qw ":$1 " && return 0 || return 1; }
 
-# 生成随机安全端口（10000-60000，避开黑名单和已占用端口）
+# base64 兼容（Alpine 不支持 -w0）
+b64_encode() { base64 | tr -d '\n'; }
+
+# 生成随机安全端口
 random_port() {
     local port
     while true; do
         port=$((RANDOM % 50001 + 10000))
-        # 检查黑名单
         local blocked=false
         for bp in $BLOCKED_PORTS; do
             [ "$port" = "$bp" ] && blocked=true && break
         done
         $blocked && continue
-        # 检查占用
         port_used "$port" && continue
         echo "$port"
         return
@@ -69,7 +189,6 @@ read_port() {
         read -p "监听端口 [回车随机 $default_port]: " port
         port="${port:-$default_port}"
         [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { warn "端口范围 1-65535"; continue; }
-        # 检查黑名单
         for bp in $BLOCKED_PORTS; do
             if [ "$port" = "$bp" ]; then
                 warn "端口 $port 是常用服务端口，建议换一个"
@@ -87,28 +206,70 @@ read_port() {
     done
 }
 
+# NAT 模式下读取外部 IP 和端口
+read_nat_info() {
+    if [ "$NAT_MODE" = true ]; then
+        echo ""
+        warn "NAT 模式：需要填写外部映射信息"
+        read -p "外部 IP (服务商提供的公网 IP): " ext_ip
+        read -p "外部端口 (服务商面板映射的外部端口): " ext_port
+        echo "$ext_ip|$ext_port"
+    else
+        echo "|"
+    fi
+}
+
 # ============================================
-#  防火墙
+#  防火墙（多系统适配）
 # ============================================
 
 open_firewall() {
     local port=$1
-    iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || \
-        iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+
+    # firewalld (CentOS/Rocky)
+    if command -v firewall-cmd &>/dev/null; then
+        firewall-cmd --add-port="$port"/tcp --permanent 2>/dev/null && \
+            firewall-cmd --reload 2>/dev/null
+        return
+    fi
+
+    # iptables (Ubuntu/Debian/Alpine)
+    if command -v iptables &>/dev/null; then
+        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || \
+            iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+        command -v netfilter-persistent &>/dev/null && netfilter-persistent save &>/dev/null
+        return
+    fi
+
+    # ufw
     command -v ufw &>/dev/null && ufw allow "$port"/tcp &>/dev/null
-    command -v netfilter-persistent &>/dev/null && netfilter-persistent save &>/dev/null
 }
 
 close_firewall() {
     local port=$1
-    iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+
+    if command -v firewall-cmd &>/dev/null; then
+        firewall-cmd --remove-port="$port"/tcp --permanent 2>/dev/null && \
+            firewall-cmd --reload 2>/dev/null
+        return
+    fi
+
+    if command -v iptables &>/dev/null; then
+        iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+        command -v netfilter-persistent &>/dev/null && netfilter-persistent save &>/dev/null
+        return
+    fi
+
     command -v ufw &>/dev/null && ufw delete allow "$port"/tcp &>/dev/null || true
-    command -v netfilter-persistent &>/dev/null && netfilter-persistent save &>/dev/null
 }
 
 # ============================================
 #  配置管理（nodes.txt 为唯一数据源）
 # ============================================
+
+# nodes.txt 格式:
+#   vless|port|uuid|flow|sni|privkey|pubkey|shortid|remark|ext_ip|ext_port
+#   ss|port|method|password|remark|ext_ip|ext_port
 
 rebuild_config() {
     local config='{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"protocol":"freedom"}]}'
@@ -118,7 +279,7 @@ rebuild_config() {
         return
     fi
 
-    while IFS='|' read -r _type _port _f3 _f4 _f5 _f6 _f7 _f8 _f9; do
+    while IFS='|' read -r _type _port _f3 _f4 _f5 _f6 _f7 _f8 _f9 _f10 _f11; do
         if [ "$_type" = "vless" ]; then
             local inbound=$(jq -n \
                 --arg port "$_port" --arg uuid "$_f3" --arg flow "$_f4" \
@@ -140,10 +301,6 @@ rebuild_config() {
     done < "$NODES_DB"
 
     echo "$config" | jq '.' > "$XRAY_CONF"
-}
-
-restart_xray() {
-    systemctl restart xray && msg "Xray 已重启" || err "Xray 重启失败"
 }
 
 # ============================================
@@ -169,24 +326,33 @@ add_vless() {
     read -p "节点备注 [回车默认 VLESS-$port]: " remark
     remark="${remark:-VLESS-$port}"
 
+    # NAT 模式读取外部信息
+    local nat_info=$(read_nat_info)
+    local ext_ip=$(echo "$nat_info" | cut -d'|' -f1)
+    local ext_port=$(echo "$nat_info" | cut -d'|' -f2)
+
     # 写入 nodes.txt
-    echo "vless|$port|$uuid|xtls-rprx-vision|$sni|$privkey|$pubkey|$shortid|$remark" >> "$NODES_DB"
+    echo "vless|$port|$uuid|xtls-rprx-vision|$sni|$privkey|$pubkey|$shortid|$remark|$ext_ip|$ext_port" >> "$NODES_DB"
 
     # 重建配置 + 防火墙 + 重启
     rebuild_config
     open_firewall "$port"
     restart_xray
 
-    # 输出信息
+    # 生成链接用的 IP 和端口
+    local link_ip="${ext_ip:-$PUBLIC_IP}"
+    local link_port="${ext_port:-$port}"
+
     echo ""
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
     msg "节点创建成功！"
     echo -e "  端口:   ${B}$port${N}"
     echo -e "  UUID:   ${B}$uuid${N}"
     echo -e "  SNI:    ${B}$sni${N}"
+    [ -n "$ext_ip" ] && echo -e "  外部:   ${B}$ext_ip:$ext_port → 内部 $port${N}"
     echo ""
     echo -e "  客户端链接:"
-    echo -e "  ${G}vless://${uuid}@${PUBLIC_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pubkey}&sid=${shortid}&spx=%2F&type=tcp#${remark}${N}"
+    echo -e "  ${G}vless://${uuid}@${link_ip}:${link_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pubkey}&sid=${shortid}&spx=%2F&type=tcp#${remark}${N}"
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
 }
 
@@ -208,16 +374,23 @@ add_ss() {
     read -p "节点备注 [回车默认 SS-$port]: " remark
     remark="${remark:-SS-$port}"
 
+    # NAT 模式读取外部信息
+    local nat_info=$(read_nat_info)
+    local ext_ip=$(echo "$nat_info" | cut -d'|' -f1)
+    local ext_port=$(echo "$nat_info" | cut -d'|' -f2)
+
     # 写入 nodes.txt
-    echo "ss|$port|$method|$password|$remark" >> "$NODES_DB"
+    echo "ss|$port|$method|$password|$remark|$ext_ip|$ext_port" >> "$NODES_DB"
 
     # 重建配置 + 防火墙 + 重启
     rebuild_config
     open_firewall "$port"
     restart_xray
 
-    # 生成 SS 链接
-    local ss_link=$(printf "%s:%s@%s:%s" "$method" "$password" "$PUBLIC_IP" "$port" | base64 -w0)
+    # 生成链接用的 IP 和端口
+    local link_ip="${ext_ip:-$PUBLIC_IP}"
+    local link_port="${ext_port:-$port}"
+    local ss_link=$(printf "%s:%s@%s:%s" "$method" "$password" "$link_ip" "$link_port" | b64_encode)
 
     echo ""
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
@@ -225,6 +398,7 @@ add_ss() {
     echo -e "  端口:     ${B}$port${N}"
     echo -e "  加密方式: ${B}$method${N}"
     echo -e "  密码:     ${B}$password${N}"
+    [ -n "$ext_ip" ] && echo -e "  外部:     ${B}$ext_ip:$ext_port → 内部 $port${N}"
     echo ""
     echo -e "  客户端链接:"
     echo -e "  ${G}ss://${ss_link}#${remark}${N}"
@@ -246,15 +420,20 @@ list_nodes() {
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
 
     local i=1
-    while IFS='|' read -r type port f3 f4 f5 f6 f7 f8 f9; do
+    while IFS='|' read -r type port f3 f4 f5 f6 f7 f8 f9 f10 f11; do
+        local link_ip="${f10:-$PUBLIC_IP}"
+        local link_port="${f11:-$port}"
+
         if [ "$type" = "vless" ]; then
             echo -e "  ${G}$i${N}. ${B}[VLESS+Reality]${N} $f9"
             echo -e "     端口: $port | SNI: $f5"
-            echo -e "     链接: vless://${f3}@${PUBLIC_IP}:${port}?encryption=none&flow=${f4}&security=reality&sni=${f5}&fp=chrome&pbk=${f7}&sid=${f8}&spx=%2F&type=tcp#${f9}"
+            [ -n "$f10" ] && echo -e "     NAT:  $f10:$f11 → 内部 $port"
+            echo -e "     链接: vless://${f3}@${link_ip}:${link_port}?encryption=none&flow=${f4}&security=reality&sni=${f5}&fp=chrome&pbk=${f7}&sid=${f8}&spx=%2F&type=tcp#${f9}"
         elif [ "$type" = "ss" ]; then
-            local ss_link=$(printf "%s:%s@%s:%s" "$f3" "$f4" "$PUBLIC_IP" "$port" | base64 -w0)
+            local ss_link=$(printf "%s:%s@%s:%s" "$f3" "$f4" "$link_ip" "$link_port" | b64_encode)
             echo -e "  ${G}$i${N}. ${B}[Shadowsocks]${N} $f5"
             echo -e "     端口: $port | 加密: $f3"
+            [ -n "$f10" ] && echo -e "     NAT:  $f10:$f11 → 内部 $port"
             echo -e "     链接: ss://${ss_link}#${f5}"
         fi
         ((i++))
@@ -286,16 +465,15 @@ delete_node() {
     local line=$(sed -n "${num}p" "$NODES_DB")
     local port=$(echo "$line" | cut -d'|' -f2)
     local remark=$(echo "$line" | cut -d'|' -f9)
+    [ -z "$remark" ] && remark=$(echo "$line" | cut -d'|' -f5)
 
     echo ""
     warn "即将删除: 端口 $port ($remark)"
     read -p "确认删除? [y/N] " yn
     [[ "$yn" =~ ^[Yy]$ ]] || { warn "已取消"; return; }
 
-    # 从 nodes.txt 删除
     sed -i "${num}d" "$NODES_DB"
 
-    # 重建配置 + 关闭防火墙 + 重启
     rebuild_config
     close_firewall "$port"
     restart_xray
@@ -316,11 +494,14 @@ export_links() {
     echo -e "${B}所有节点链接:${N}"
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
 
-    while IFS='|' read -r type port f3 f4 f5 f6 f7 f8 f9; do
+    while IFS='|' read -r type port f3 f4 f5 f6 f7 f8 f9 f10 f11; do
+        local link_ip="${f10:-$PUBLIC_IP}"
+        local link_port="${f11:-$port}"
+
         if [ "$type" = "vless" ]; then
-            echo "vless://${f3}@${PUBLIC_IP}:${port}?encryption=none&flow=${f4}&security=reality&sni=${f5}&fp=chrome&pbk=${f7}&sid=${f8}&spx=%2F&type=tcp#${f9}"
+            echo "vless://${f3}@${link_ip}:${link_port}?encryption=none&flow=${f4}&security=reality&sni=${f5}&fp=chrome&pbk=${f7}&sid=${f8}&spx=%2F&type=tcp#${f9}"
         elif [ "$type" = "ss" ]; then
-            local ss_link=$(printf "%s:%s@%s:%s" "$f3" "$f4" "$PUBLIC_IP" "$port" | base64 -w0)
+            local ss_link=$(printf "%s:%s@%s:%s" "$f3" "$f4" "$link_ip" "$link_port" | b64_encode)
             echo "ss://${ss_link}#${f5}"
         fi
     done < "$NODES_DB"
@@ -354,10 +535,10 @@ uninstall() {
         done < "$NODES_DB"
     fi
 
-    # 停止服务
+    # 停止并禁用服务
     msg "停止 xray 服务..."
-    systemctl stop xray 2>/dev/null || true
-    systemctl disable xray 2>/dev/null || true
+    svc_stop
+    svc_disable
 
     # 删除文件
     msg "清理文件..."
@@ -373,9 +554,16 @@ uninstall() {
         bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh) remove 2>/dev/null || \
             rm -f /usr/local/bin/xray
     fi
+
+    # 清理服务文件
     rm -f /etc/systemd/system/xray.service
     rm -f /etc/systemd/system/xray@.service
-    systemctl daemon-reload 2>/dev/null || true
+    rm -f /etc/init.d/xray
+    [ "$SVC_TYPE" = "systemd" ] && systemctl daemon-reload 2>/dev/null || true
+
+    # 清理快捷命令
+    rm -f /usr/local/bin/xff
+    rm -f /usr/local/bin/xray-manager.sh
 
     echo ""
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
@@ -433,7 +621,6 @@ install_shortcut() {
     local script_path="/usr/local/bin/xray-manager.sh"
     local shortcut="/usr/local/bin/xff"
 
-    # 下载脚本到本地（管道模式下 $0 不可用）
     if [ ! -f "$script_path" ] || ! grep -q "Xray 节点管理" "$script_path" 2>/dev/null; then
         curl -fsSL --connect-timeout 10 --max-time 60 \
             "https://raw.githubusercontent.com/masatoshiyokoyama635-sudo/vps-scripts/master/xray-manager.sh" \
@@ -443,7 +630,6 @@ install_shortcut() {
         chmod +x "$script_path"
     fi
 
-    # 创建快捷命令（符号链接）
     if [ ! -L "$shortcut" ] && [ ! -f "$shortcut" ]; then
         ln -sf "$script_path" "$shortcut"
         msg "快捷命令 xff 已安装，以后输入 xff 即可进入管理"
@@ -455,8 +641,14 @@ install_shortcut() {
 # ============================================
 
 main() {
+    detect_os
     check_deps
     install_shortcut
+
+    # 兼容旧版 nodes.txt（没有 ext_ip/ext_port 字段）
+    if [ -f "$NODES_DB" ] && [ -s "$NODES_DB" ]; then
+        sed -i '/^vless|/s/|$//' "$NODES_DB" 2>/dev/null
+    fi
 
     # 如果已有手动配置的节点但没有 nodes.txt，提示用户
     if [ -f "$XRAY_CONF" ] && [ ! -f "$NODES_DB" ]; then
