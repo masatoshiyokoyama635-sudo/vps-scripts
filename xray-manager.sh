@@ -4,8 +4,6 @@
 #   支持: VLESS+Reality+TCP / Shadowsocks
 # ============================================
 
-set -e
-
 # ---- 配置 ----
 XRAY_CONF="/usr/local/etc/xray/config.json"
 NODES_DB="/usr/local/etc/xray/nodes.txt"
