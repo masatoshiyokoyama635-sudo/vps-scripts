@@ -89,12 +89,12 @@ rebuild_config() {
         return
     fi
 
-    while IFS='|' read -r type port f3 f4 f5 f6 f7 f8 f9; do
-        if [ "$type" = "vless" ]; then
+    while IFS='|' read -r _type _port _f3 _f4 _f5 _f6 _f7 _f8 _f9; do
+        if [ "$_type" = "vless" ]; then
             # vless|port|uuid|flow|sni|privkey|pubkey|shortid|remark
             local inbound=$(jq -n \
-                --arg port "$port" --arg uuid "$f3" --arg flow "$f4" \
-                --arg sni "$f5" --arg privkey "$f6" --arg shortid "$f8" \
+                --arg port "$_port" --arg uuid "$_f3" --arg flow "$_f4" \
+                --arg sni "$_f5" --arg privkey "$_f6" --arg shortid "$_f8" \
                 '{listen:"0.0.0.0",port:($port|tonumber),protocol:"vless",
                   settings:{clients:[{id:$uuid,flow:$flow}],decryption:"none"},
                   streamSettings:{network:"tcp",security:"reality",
@@ -102,10 +102,10 @@ rebuild_config() {
                       privateKey:$privkey,shortIds:[$shortid]}}}')
             config=$(echo "$config" | jq --argjson ib "$inbound" '.inbounds += [$ib]')
 
-        elif [ "$type" = "ss" ]; then
+        elif [ "$_type" = "ss" ]; then
             # ss|port|method|password|remark
             local inbound=$(jq -n \
-                --arg port "$port" --arg method "$f3" --arg password "$f4" \
+                --arg port "$_port" --arg method "$_f3" --arg password "$_f4" \
                 '{listen:"0.0.0.0",port:($port|tonumber),protocol:"shadowsocks",
                   settings:{method:$method,password:$password,network:"tcp,udp"}}')
             config=$(echo "$config" | jq --argjson ib "$inbound" '.inbounds += [$ib]')
