@@ -435,13 +435,17 @@ install_shortcut() {
 
     # 下载脚本到本地（管道模式下 $0 不可用）
     if [ ! -f "$script_path" ] || ! grep -q "Xray 节点管理" "$script_path" 2>/dev/null; then
-        curl -sL "https://raw.githubusercontent.com/masatoshiyokoyama635-sudo/vps-scripts/master/xray-manager.sh" -o "$script_path" && chmod +x "$script_path"
+        curl -fsSL --connect-timeout 10 --max-time 60 \
+            "https://raw.githubusercontent.com/masatoshiyokoyama635-sudo/vps-scripts/master/xray-manager.sh" \
+            -o "$script_path" 2>/dev/null || \
+        wget -qO "$script_path" \
+            "https://raw.githubusercontent.com/masatoshiyokoyama635-sudo/vps-scripts/master/xray-manager.sh" 2>/dev/null
+        chmod +x "$script_path"
     fi
 
-    # 创建快捷命令
-    if [ ! -f "$shortcut" ]; then
-        printf '#!/bin/bash\nbash %s "$@"\n' "$script_path" > "$shortcut"
-        chmod +x "$shortcut"
+    # 创建快捷命令（符号链接）
+    if [ ! -L "$shortcut" ] && [ ! -f "$shortcut" ]; then
+        ln -sf "$script_path" "$shortcut"
         msg "快捷命令 xff 已安装，以后输入 xff 即可进入管理"
     fi
 }
