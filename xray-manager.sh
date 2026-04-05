@@ -38,7 +38,7 @@ check_deps() {
         [[ "$yn" =~ ^[Yy]$ ]] || exit 1
         bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh) install
     fi
-    PUBLIC_IP=$(curl -s ip.sb)
+    PUBLIC_IP=$(curl -s -4 ip.sb || curl -s api.ipify.org || curl -s ipv4.icanhazip.com)
     mkdir -p /usr/local/etc/xray
 }
 
