@@ -11,6 +11,9 @@ XRAY_CONF="/usr/local/etc/xray/config.json"
 NODES_DB="/usr/local/etc/xray/nodes.txt"
 PUBLIC_IP=""
 
+# 重要端口黑名单（不随机分配）
+BLOCKED_PORTS="22 53 80 443 445 993 995 3389 5900 8080 8443 8888"
+
 # ---- 颜色 ----
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[0;33m'
 C='\033[0;36m'; B='\033[1m';    N='\033[0m'
@@ -43,11 +46,40 @@ check_deps() {
 
 port_used() { ss -tlnp 2>/dev/null | grep -qw ":$1 " && return 0 || return 1; }
 
-read_port() {
+# 生成随机安全端口（10000-60000，避开黑名单和已占用端口）
+random_port() {
     local port
     while true; do
-        read -p "输入监听端口: " port
+        port=$((RANDOM % 50001 + 10000))
+        # 检查黑名单
+        local blocked=false
+        for bp in $BLOCKED_PORTS; do
+            [ "$port" = "$bp" ] && blocked=true && break
+        done
+        $blocked && continue
+        # 检查占用
+        port_used "$port" && continue
+        echo "$port"
+        return
+    done
+}
+
+read_port() {
+    local port default_port
+    default_port=$(random_port)
+    while true; do
+        read -p "监听端口 [回车随机 $default_port]: " port
+        port="${port:-$default_port}"
         [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { warn "端口范围 1-65535"; continue; }
+        # 检查黑名单
+        for bp in $BLOCKED_PORTS; do
+            if [ "$port" = "$bp" ]; then
+                warn "端口 $port 是常用服务端口，建议换一个"
+                read -p "仍然使用? [y/N] " force
+                [[ "$force" =~ ^[Yy]$ ]] || { continue 2; }
+                break
+            fi
+        done
         if port_used "$port"; then
             warn "端口 $port 已被占用"
             continue
@@ -80,7 +112,6 @@ close_firewall() {
 #  配置管理（nodes.txt 为唯一数据源）
 # ============================================
 
-# 从 nodes.txt 重新生成 xray 配置
 rebuild_config() {
     local config='{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"protocol":"freedom"}]}'
 
@@ -91,7 +122,6 @@ rebuild_config() {
 
     while IFS='|' read -r _type _port _f3 _f4 _f5 _f6 _f7 _f8 _f9; do
         if [ "$_type" = "vless" ]; then
-            # vless|port|uuid|flow|sni|privkey|pubkey|shortid|remark
             local inbound=$(jq -n \
                 --arg port "$_port" --arg uuid "$_f3" --arg flow "$_f4" \
                 --arg sni "$_f5" --arg privkey "$_f6" --arg shortid "$_f8" \
@@ -103,7 +133,6 @@ rebuild_config() {
             config=$(echo "$config" | jq --argjson ib "$inbound" '.inbounds += [$ib]')
 
         elif [ "$_type" = "ss" ]; then
-            # ss|port|method|password|remark
             local inbound=$(jq -n \
                 --arg port "$_port" --arg method "$_f3" --arg password "$_f4" \
                 '{listen:"0.0.0.0",port:($port|tonumber),protocol:"shadowsocks",
@@ -258,7 +287,6 @@ delete_node() {
 
     local line=$(sed -n "${num}p" "$NODES_DB")
     local port=$(echo "$line" | cut -d'|' -f2)
-    local type=$(echo "$line" | cut -d'|' -f1)
     local remark=$(echo "$line" | cut -d'|' -f9)
 
     echo ""
@@ -303,6 +331,65 @@ export_links() {
 }
 
 # ============================================
+#  卸载
+# ============================================
+
+uninstall() {
+    echo -e "\n${B}━━━ 卸载 Xray 及所有节点 ━━━${N}\n"
+    warn "此操作将:"
+    warn "  1. 停止并禁用 xray 服务"
+    warn "  2. 删除所有节点数据 (nodes.txt)"
+    warn "  3. 删除 xray 配置文件"
+    warn "  4. 关闭所有节点防火墙端口"
+    warn "  5. 卸载 xray 程序"
+    echo ""
+    echo -e "  ${R}此操作不可恢复！${N}"
+    echo ""
+    read -p "确认卸载? 输入 YES 确认: " confirm
+    [ "$confirm" = "YES" ] || { warn "已取消"; return; }
+
+    # 关闭所有节点防火墙端口
+    if [ -f "$NODES_DB" ] && [ -s "$NODES_DB" ]; then
+        msg "关闭防火墙端口..."
+        while IFS='|' read -r _type _port _rest; do
+            [ -n "$_port" ] && close_firewall "$_port"
+        done < "$NODES_DB"
+    fi
+
+    # 停止服务
+    msg "停止 xray 服务..."
+    systemctl stop xray 2>/dev/null || true
+    systemctl disable xray 2>/dev/null || true
+
+    # 删除文件
+    msg "清理文件..."
+    rm -f "$NODES_DB"
+    rm -f "$XRAY_CONF"
+    rm -f "${XRAY_CONF}.bak"
+    rm -rf /usr/local/etc/xray/
+    rm -rf /var/log/xray/
+
+    # 卸载 xray
+    msg "卸载 xray..."
+    if command -v xray &>/dev/null; then
+        bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh) remove 2>/dev/null || \
+            rm -f /usr/local/bin/xray
+    fi
+    rm -f /etc/systemd/system/xray.service
+    rm -f /etc/systemd/system/xray@.service
+    systemctl daemon-reload 2>/dev/null || true
+
+    echo ""
+    echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    msg "Xray 已完全卸载，VPS 恢复干净状态"
+    msg "可以重新运行脚本开始配置"
+    echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    echo ""
+    read -p "按回车退出..." dummy
+    exit 0
+}
+
+# ============================================
 #  主菜单
 # ============================================
 
@@ -319,9 +406,10 @@ show_menu() {
     echo -e "  ${B}3.${N} 查看所有节点"
     echo -e "  ${B}4.${N} 删除节点"
     echo -e "  ${B}5.${N} 导出所有链接"
+    echo -e "  ${B}6.${N} 卸载 (清空所有数据)"
     echo -e "  ${B}0.${N} 退出"
     echo ""
-    read -p "请选择 [0-5]: " choice
+    read -p "请选择 [0-6]: " choice
 
     case $choice in
         1) add_vless ;;
@@ -329,6 +417,7 @@ show_menu() {
         3) list_nodes ;;
         4) delete_node ;;
         5) export_links ;;
+        6) uninstall ;;
         0) echo -e "\n再见！"; exit 0 ;;
         *) warn "无效选择" ;;
     esac
