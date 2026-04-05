@@ -433,9 +433,9 @@ install_shortcut() {
     local script_path="/usr/local/bin/xray-manager.sh"
     local shortcut="/usr/local/bin/xff"
 
-    # 如果脚本不是从 /usr/local/bin 运行的，先复制过去
+    # 下载脚本到本地（管道模式下 $0 不可用）
     if [ ! -f "$script_path" ] || ! grep -q "Xray 节点管理" "$script_path" 2>/dev/null; then
-        cp "$0" "$script_path" 2>/dev/null && chmod +x "$script_path"
+        curl -sL "https://raw.githubusercontent.com/masatoshiyokoyama635-sudo/vps-scripts/master/xray-manager.sh" -o "$script_path" && chmod +x "$script_path"
     fi
 
     # 创建快捷命令
