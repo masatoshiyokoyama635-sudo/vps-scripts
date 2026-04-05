@@ -397,6 +397,7 @@ show_menu() {
     echo "╔═══════════════════════════════════════╗"
     echo "║       Xray 节点管理脚本               ║"
     echo "║   VLESS+Reality / Shadowsocks         ║"
+    echo "║   快捷命令: xff                       ║"
     echo "╚═══════════════════════════════════════╝"
     echo -e "${N}"
     echo -e "  ${B}1.${N} 添加 VLESS+Reality 节点"
@@ -425,11 +426,33 @@ show_menu() {
 }
 
 # ============================================
+#  安装快捷命令 xff
+# ============================================
+
+install_shortcut() {
+    local script_path="/usr/local/bin/xray-manager.sh"
+    local shortcut="/usr/local/bin/xff"
+
+    # 如果脚本不是从 /usr/local/bin 运行的，先复制过去
+    if [ ! -f "$script_path" ] || ! grep -q "Xray 节点管理" "$script_path" 2>/dev/null; then
+        cp "$0" "$script_path" 2>/dev/null && chmod +x "$script_path"
+    fi
+
+    # 创建快捷命令
+    if [ ! -f "$shortcut" ]; then
+        printf '#!/bin/bash\nbash %s "$@"\n' "$script_path" > "$shortcut"
+        chmod +x "$shortcut"
+        msg "快捷命令 xff 已安装，以后输入 xff 即可进入管理"
+    fi
+}
+
+# ============================================
 #  入口
 # ============================================
 
 main() {
     check_deps
+    install_shortcut
 
     # 如果已有手动配置的节点但没有 nodes.txt，提示用户
     if [ -f "$XRAY_CONF" ] && [ ! -f "$NODES_DB" ]; then
