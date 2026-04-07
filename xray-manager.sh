@@ -4,6 +4,7 @@
 #   支持: Ubuntu/Debian, Alpine, CentOS/Rocky
 #   支持: VLESS+Reality+TCP / Shadowsocks
 #   支持: NAT 小鸡
+#   支持: BBR 加速
 # ============================================
 
 # ---- 配置 ----
@@ -620,6 +621,179 @@ uninstall() {
 }
 
 # ============================================
+#  BBR 加速
+# ============================================
+
+BBR_CONF="/etc/sysctl.d/99-bbr-xray.conf"
+
+enable_bbr() {
+    echo -e "\n${B}━━━ 启用 BBR 加速 ━━━${N}\n"
+
+    # 检查当前状态（同时接受 fq 和 cake）
+    local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+
+    if [[ "$current_cc" == "bbr" ]] && [[ "$current_qdisc" =~ ^(fq|cake)$ ]]; then
+        msg "BBR 已启用，无需重复操作"
+        echo -e "  当前拥塞控制: ${B}$current_cc${N}"
+        echo -e "  当前队列算法: ${B}$current_qdisc${N}"
+        return
+    fi
+
+    echo -e "  当前拥塞控制: ${Y}${current_cc:-未设置}${N}"
+    echo -e "  当前队列算法: ${Y}${current_qdisc:-未设置}${N}"
+    echo ""
+
+    # 检查内核版本（BBR 需要 4.9+）
+    local kv=$(uname -r | cut -d. -f1-2)
+    local major=$(echo "$kv" | cut -d. -f1)
+    local minor=$(echo "$kv" | cut -d. -f2)
+    if [ "$major" -lt 4 ] || { [ "$major" -eq 4 ] && [ "$minor" -lt 9 ]; }; then
+        err "内核版本 $(uname -r) 过低，BBR 需要 4.9+"
+        return
+    fi
+    msg "内核版本: $(uname -r) (满足 BBR 要求)"
+
+    # 加载 BBR 模块
+    if ! modprobe tcp_bbr 2>/dev/null; then
+        err "无法加载 tcp_bbr 模块，当前内核可能未编译 BBR 支持"
+        return
+    fi
+    msg "tcp_bbr 模块已加载"
+
+    # 确保 bbr 开机自动加载
+    if ! grep -q "tcp_bbr" /etc/modules-load.d/bbr.conf 2>/dev/null; then
+        printf "tcp_bbr\n" > /etc/modules-load.d/bbr.conf
+    fi
+
+    # 持久化写入
+    if [ -d /etc/sysctl.d ]; then
+        # 保存旧值到注释行，供 disable_bbr 回滚
+        printf "#%s:%s\n" "$current_qdisc" "$current_cc" > "$BBR_CONF"
+        printf "net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n" >> "$BBR_CONF"
+
+        # 注释掉 /etc/sysctl.conf 中已有的冲突行，避免两个文件打架
+        if [ -f /etc/sysctl.conf ]; then
+            sed -i -E 's/^[[:space:]]*(net\.core\.default_qdisc)/#&/' /etc/sysctl.conf
+            sed -i -E 's/^[[:space:]]*(net\.ipv4\.tcp_congestion_control)/#&/' /etc/sysctl.conf
+        fi
+
+        sysctl --system &>/dev/null
+    else
+        # 没有 sysctl.d 的老系统，直接写 sysctl.conf
+        sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+        sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+        printf "net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n" >> /etc/sysctl.conf
+        sysctl -p &>/dev/null
+    fi
+
+    # 验证
+    local new_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    local new_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+
+    if [[ "$new_cc" == "bbr" ]]; then
+        echo ""
+        echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+        msg "BBR 加速已启用！"
+        echo -e "  拥塞控制: ${B}$new_cc${N}"
+        echo -e "  队列算法: ${B}$new_qdisc${N}"
+        echo -e "  持久化:   ${B}${BBR_CONF}${N}"
+        echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    else
+        err "BBR 启用失败，请检查内核是否支持"
+    fi
+}
+
+disable_bbr() {
+    echo -e "\n${B}━━━ 关闭 BBR 加速 ━━━${N}\n"
+
+    # 检查当前状态
+    local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+
+    if [[ "$current_cc" != "bbr" ]] && [[ "$current_qdisc" != "fq" && "$current_qdisc" != "cake" ]]; then
+        msg "BBR 未启用，无需操作"
+        return
+    fi
+
+    if [ -f "$BBR_CONF" ]; then
+        # 从注释行读取旧值回滚
+        local old_values=$(head -1 "$BBR_CONF" | sed 's/^#//')
+        local old_qdisc=$(echo "$old_values" | cut -d: -f1)
+        local old_cc=$(echo "$old_values" | cut -d: -f2)
+
+        old_qdisc="${old_qdisc:-cubic}"
+        old_cc="${old_cc:-pfifo_fast}"
+
+        msg "恢复原始设置: 拥塞控制=$old_cc, 队列算法=$old_qdisc"
+
+        # 删除 BBR 配置文件
+        rm -f "$BBR_CONF"
+
+        # 恢复 /etc/sysctl.conf 中被注释的行
+        if [ -f /etc/sysctl.conf ]; then
+            sed -i -E 's/^#[[:space:]]*(net\.core\.default_qdisc)/\1/' /etc/sysctl.conf
+            sed -i -E 's/^#[[:space:]]*(net\.ipv4\.tcp_congestion_control)/\1/' /etc/sysctl.conf
+        fi
+
+        sysctl -w net.core.default_qdisc="$old_qdisc" &>/dev/null
+        sysctl -w net.ipv4.tcp_congestion_control="$old_cc" &>/dev/null
+        sysctl --system &>/dev/null
+    else
+        # 没有保存旧值，回退到默认 cubic + pfifo_fast
+        warn "未找到 BBR 配置备份，恢复为默认值 (cubic + pfifo_fast)"
+
+        if [ -f /etc/sysctl.conf ]; then
+            sed -i 's/net\.core\.default_qdisc=fq/net.core.default_qdisc=pfifo_fast/' /etc/sysctl.conf
+            sed -i 's/net\.ipv4\.tcp_congestion_control=bbr/net.ipv4.tcp_congestion_control=cubic/' /etc/sctl.conf 2>/dev/null
+        fi
+
+        sysctl -w net.core.default_qdisc=pfifo_fast &>/dev/null
+        sysctl -w net.ipv4.tcp_congestion_control=cubic &>/dev/null
+        sysctl --system &>/dev/null || sysctl -p &>/dev/null
+    fi
+
+    # 移除模块开机自加载
+    rm -f /etc/modules-load.d/bbr.conf
+
+    # 验证
+    local new_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    local new_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+
+    if [[ "$new_cc" != "bbr" ]]; then
+        echo ""
+        echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+        msg "BBR 已关闭！"
+        echo -e "  拥塞控制: ${B}$new_cc${N}"
+        echo -e "  队列算法: ${B}$new_qdisc${N}"
+        echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    else
+        err "BBR 关闭失败，请手动检查 sysctl 配置"
+    fi
+}
+
+bbr_menu() {
+    echo -e "\n${B}━━━ BBR 加速管理 ━━━${N}\n"
+
+    local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    echo -e "  当前状态: 拥塞控制=${B}$current_cc${N}, 队列算法=${B}$current_qdisc${N}"
+    echo ""
+    echo -e "  ${B}1.${N} 启用 BBR"
+    echo -e "  ${B}2.${N} 关闭 BBR"
+    echo -e "  ${B}0.${N} 返回主菜单"
+    echo ""
+    read -p "请选择 [0-2]: " bbr_choice
+
+    case $bbr_choice in
+        1) enable_bbr ;;
+        2) disable_bbr ;;
+        0) return ;;
+        *) warn "无效选择" ;;
+    esac
+}
+
+# ============================================
 #  主菜单
 # ============================================
 
@@ -639,9 +813,10 @@ show_menu() {
     echo -e "  ${B}5.${N} 修改节点端口"
     echo -e "  ${B}6.${N} 导出所有链接"
     echo -e "  ${B}7.${N} 卸载 (清空所有数据)"
+    echo -e "  ${B}8.${N} BBR 加速"
     echo -e "  ${B}0.${N} 退出"
     echo ""
-    read -p "请选择 [0-7]: " choice
+    read -p "请选择 [0-8]: " choice
 
     case $choice in
         1) add_vless ;;
@@ -651,6 +826,7 @@ show_menu() {
         5) modify_port ;;
         6) export_links ;;
         7) uninstall ;;
+        8) bbr_menu ;;
         0) echo -e "\n再见！"; exit 0 ;;
         *) warn "无效选择" ;;
     esac
