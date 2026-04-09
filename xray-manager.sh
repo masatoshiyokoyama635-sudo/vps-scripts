@@ -105,9 +105,23 @@ check_deps() {
     fi
 
     if ! command -v xray &>/dev/null; then
+    if ! command -v xray &>/dev/null; then
         read -p "未检测到 Xray，是否安装? [y/N] " yn
         [[ "$yn" =~ ^[Yy]$ ]] || exit 1
         bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh) install
+        # 安装后验证二进制是否存在（官方脚本在 Alpine 上可能不装二进制）
+        if ! command -v xray &>/dev/null; then
+            warn "官方安装脚本未成功部署二进制，尝试手动安装..."
+            mkdir -p /usr/local/bin /usr/local/etc/xray
+            curl -L https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o /tmp/xray.zip
+            unzip -o /tmp/xray.zip -d /tmp/xray &>/dev/null || { apk add --no-cache unzip >/dev/null 2>&1; unzip -o /tmp/xray.zip -d /tmp/xray; }
+            cp /tmp/xray/xray /usr/local/bin/xray && chmod +x /usr/local/bin/xray
+            rm -rf /tmp/xray /tmp/xray.zip
+        fi
+        if ! command -v xray &>/dev/null; then
+            err "Xray 安装失败，请手动安装后重试"
+            exit 1
+        fi
         setup_xray_service
     fi
 
@@ -319,8 +333,13 @@ add_vless() {
     local privkey=$(echo "$keys" | grep -i "private" | awk '{print $NF}')
     local pubkey=$(echo "$keys" | grep -i "public" | awk '{print $NF}')
     local shortid=$(openssl rand -hex 8)
+    # 校验密钥是否生成成功
+    if [ -z "$uuid" ] || [ -z "$privkey" ] || [ -z "$pubkey" ]; then
+        err "密钥生成失败，请确认 xray 已正确安装: xray version"
+        return 1
+    fi
 
-    local default_sni="www.sony.com"
+    local default_sni="www.microsoft.com"
     read -p "伪装域名 [回车默认 $default_sni]: " sni
     sni="${sni:-$default_sni}"
 
