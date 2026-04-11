@@ -113,7 +113,7 @@ check_deps() {
             warn "官方安装脚本未成功部署二进制，尝试手动安装..."
             mkdir -p /usr/local/bin /usr/local/etc/xray
             curl -L https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o /tmp/xray.zip
-            unzip -o /tmp/xray.zip -d /tmp/xray &>/dev/null || { apk add --no-cache unzip >/dev/null 2>&1; unzip -o /tmp/xray.zip -d /tmp/xray; }
+            pkg_install unzip &>/dev/null; unzip -o /tmp/xray.zip -d /tmp/xray
             cp /tmp/xray/xray /usr/local/bin/xray && chmod +x /usr/local/bin/xray
             rm -rf /tmp/xray /tmp/xray.zip
         fi
