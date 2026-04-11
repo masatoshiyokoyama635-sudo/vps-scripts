@@ -105,7 +105,6 @@ check_deps() {
     fi
 
     if ! command -v xray &>/dev/null; then
-    if ! command -v xray &>/dev/null; then
         read -p "未检测到 Xray，是否安装? [y/N] " yn
         [[ "$yn" =~ ^[Yy]$ ]] || exit 1
         bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh) install
