@@ -11,6 +11,7 @@
 XRAY_CONF="/usr/local/etc/xray/config.json"
 NODES_DB="/usr/local/etc/xray/nodes.txt"
 PUBLIC_IP=""
+PUBLIC_IP6=""
 NAT_MODE=false
 EXTERNAL_IP=""
 BLOCKED_PORTS="22 53 80 443 445 993 995 3389 5900 8080 8443 8888"
@@ -62,14 +63,26 @@ detect_os() {
     fi
     msg "服务管理: ${SVC_TYPE}"
 
-    # 检测公网 IP / NAT 模式
-    PUBLIC_IP=$(curl -s --connect-timeout 5 api.ipify.org 2>/dev/null || \
-                curl -s --connect-timeout 5 ipv4.icanhazip.com 2>/dev/null)
-    if [ -z "$PUBLIC_IP" ]; then
-        NAT_MODE=true
-        warn "未检测到公网 IPv4，进入 NAT 模式"
+    # 检测公网 IP（IPv4 / IPv6 分别检测）
+    PUBLIC_IP=$(curl -s --connect-timeout 5 -4 api.ipify.org 2>/dev/null || \
+                curl -s --connect-timeout 5 -4 ipv4.icanhazip.com 2>/dev/null)
+    if [ -n "$PUBLIC_IP" ]; then
+        msg "公网 IPv4: $PUBLIC_IP"
     else
-        msg "公网 IP: $PUBLIC_IP"
+        warn "未检测到公网 IPv4"
+    fi
+
+    PUBLIC_IP6=$(curl -s --connect-timeout 5 -6 api6.ipify.org 2>/dev/null || \
+                 curl -s --connect-timeout 5 -6 ipv6.icanhazip.com 2>/dev/null)
+    if [ -n "$PUBLIC_IP6" ]; then
+        msg "公网 IPv6: $PUBLIC_IP6"
+    else
+        warn "未检测到公网 IPv6"
+    fi
+
+    if [ -z "$PUBLIC_IP" ] && [ -z "$PUBLIC_IP6" ]; then
+        NAT_MODE=true
+        warn "未检测到公网 IP，进入 NAT 模式"
     fi
 }
 
@@ -112,7 +125,14 @@ check_deps() {
         if ! command -v xray &>/dev/null; then
             warn "官方安装脚本未成功部署二进制，尝试手动安装..."
             mkdir -p /usr/local/bin /usr/local/etc/xray
-            curl -L https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o /tmp/xray.zip
+            local arch=""
+            case "$(uname -m)" in
+                x86_64)  arch="64" ;;
+                aarch64) arch="arm64-v8a" ;;
+                armv7l)  arch="arm32-v7a" ;;
+                *)       arch="64" ;;
+            esac
+            curl -L "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${arch}.zip" -o /tmp/xray.zip
             pkg_install unzip &>/dev/null; unzip -o /tmp/xray.zip -d /tmp/xray
             cp /tmp/xray/xray /usr/local/bin/xray && chmod +x /usr/local/bin/xray
             rm -rf /tmp/xray /tmp/xray.zip
@@ -180,6 +200,16 @@ port_used() { ss -tlnp 2>/dev/null | grep -qw ":$1 " && return 0 || return 1; }
 # base64 兼容（Alpine 不支持 -w0）
 b64_encode() { base64 | tr -d '\n'; }
 
+# IPv6 地址在 URL 中需要加方括号
+fmt_host() {
+    local ip="$1" port="$2"
+    if echo "$ip" | grep -q ':'; then
+        echo "[${ip}]:${port}"
+    else
+        echo "${ip}:${port}"
+    fi
+}
+
 # 生成随机安全端口
 random_port() {
     local port
@@ -233,6 +263,31 @@ read_nat_info() {
     fi
 }
 
+# IP 版本选择（双栈时让用户选择）
+# 返回格式: ipver|link_ip|listen_addr
+choose_ip() {
+    if [ -n "$PUBLIC_IP" ] && [ -n "$PUBLIC_IP6" ]; then
+        echo -e "\n  ${B}检测到双栈 IP:${N}" >&2
+        echo -e "  ${G}1.${N} IPv4: $PUBLIC_IP" >&2
+        echo -e "  ${G}2.${N} IPv6: $PUBLIC_IP6" >&2
+        echo "" >&2
+        read -p "选择 IP 版本 [1=IPv4 / 2=IPv6]: " ip_choice
+        case "$ip_choice" in
+            2) echo "6|${PUBLIC_IP6}|::" ;;
+            *) echo "4|${PUBLIC_IP}|0.0.0.0" ;;
+        esac
+    elif [ -n "$PUBLIC_IP6" ]; then
+        echo -e "${G}[√]${N} 仅检测到 IPv6: $PUBLIC_IP6" >&2
+        echo "6|${PUBLIC_IP6}|::"
+    elif [ -n "$PUBLIC_IP" ]; then
+        echo -e "${G}[√]${N} 仅检测到 IPv4: $PUBLIC_IP" >&2
+        echo "4|${PUBLIC_IP}|0.0.0.0"
+    else
+        NAT_MODE=true
+        echo "4||0.0.0.0"
+    fi
+}
+
 # ============================================
 #  防火墙（多系统适配）
 # ============================================
@@ -282,23 +337,35 @@ close_firewall() {
 # ============================================
 
 # nodes.txt 格式:
-#   vless|port|uuid|flow|sni|privkey|pubkey|shortid|remark|ext_ip|ext_port
-#   ss|port|method|password|remark|ext_ip|ext_port
+#   vless|port|uuid|flow|sni|privkey|pubkey|shortid|remark|ipver|ext_ip|ext_port
+#   ss|port|method|password|remark|ipver|ext_ip|ext_port
 
 rebuild_config() {
-    local config='{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"protocol":"freedom"}]}'
-
     if [ ! -f "$NODES_DB" ] || [ ! -s "$NODES_DB" ]; then
-        echo "$config" | jq '.' > "$XRAY_CONF"
+        echo '{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"protocol":"freedom"}]}' | jq '.' > "$XRAY_CONF"
         return
     fi
 
-    while IFS='|' read -r _type _port _f3 _f4 _f5 _f6 _f7 _f8 _f9 _f10 _f11; do
+    local config='{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[],"routing":{"domainStrategy":"AsIs","rules":[]}}'
+    local v4_tags="[]" v6_tags="[]"
+
+    while IFS='|' read -r _type _port _f3 _f4 _f5 _f6 _f7 _f8 _f9 _f10 _f11 _f12; do
+        [ -z "$_type" ] && continue
+        local _listen="0.0.0.0" _ipver="4" _tag=""
+
         if [ "$_type" = "vless" ]; then
+            # 新格式: f10=ipver(4/6), f11=ext_ip, f12=ext_port
+            # 旧格式: f10=ext_ip, f11=ext_port, 无 ipver
+            if [ "$_f10" = "4" ] || [ "$_f10" = "6" ]; then
+                _ipver="$_f10"
+                [ "$_ipver" = "6" ] && _listen="::"
+            fi
+            _tag="v${_ipver}-${_port}"
             local inbound=$(jq -n \
+                --arg tag "$_tag" --arg listen "$_listen" \
                 --arg port "$_port" --arg uuid "$_f3" --arg flow "$_f4" \
                 --arg sni "$_f5" --arg privkey "$_f6" --arg shortid "$_f8" \
-                '{listen:"0.0.0.0",port:($port|tonumber),protocol:"vless",
+                '{tag:$tag,listen:$listen,port:($port|tonumber),protocol:"vless",
                   settings:{clients:[{id:$uuid,flow:$flow}],decryption:"none"},
                   streamSettings:{network:"tcp",security:"reality",
                     realitySettings:{dest:("\($sni):443"),serverNames:[$sni],
@@ -306,13 +373,63 @@ rebuild_config() {
             config=$(echo "$config" | jq --argjson ib "$inbound" '.inbounds += [$ib]')
 
         elif [ "$_type" = "ss" ]; then
+            # 新格式: f6=ipver(4/6), f7=ext_ip, f8=ext_port
+            # 旧格式: f6=ext_ip, f7=ext_port, 无 ipver
+            if [ "$_f6" = "4" ] || [ "$_f6" = "6" ]; then
+                _ipver="$_f6"
+                [ "$_ipver" = "6" ] && _listen="::"
+            fi
+            _tag="v${_ipver}-${_port}"
             local inbound=$(jq -n \
+                --arg tag "$_tag" --arg listen "$_listen" \
                 --arg port "$_port" --arg method "$_f3" --arg password "$_f4" \
-                '{listen:"0.0.0.0",port:($port|tonumber),protocol:"shadowsocks",
+                '{tag:$tag,listen:$listen,port:($port|tonumber),protocol:"shadowsocks",
                   settings:{method:$method,password:$password,network:"tcp,udp"}}')
             config=$(echo "$config" | jq --argjson ib "$inbound" '.inbounds += [$ib]')
+        else
+            continue
+        fi
+
+        if [ "$_ipver" = "6" ]; then
+            v6_tags=$(echo "$v6_tags" | jq --arg t "$_tag" '. += [$t]')
+        else
+            v4_tags=$(echo "$v4_tags" | jq --arg t "$_tag" '. += [$t]')
         fi
     done < "$NODES_DB"
+
+    # 构建 outbound：用 sendThrough 绑定出口 IP，强制走对应 IP 版本
+    # 仅当公网 IP 存在于本机网卡时才使用 sendThrough（NAT/容器环境可能无此 IP）
+    local v4_count=$(echo "$v4_tags" | jq 'length')
+    local v6_count=$(echo "$v6_tags" | jq 'length')
+
+    if [ "$v4_count" -gt 0 ] && [ -n "$PUBLIC_IP" ]; then
+        if ip addr show 2>/dev/null | grep -qw "$PUBLIC_IP"; then
+            config=$(echo "$config" | jq --arg ip "$PUBLIC_IP" \
+                '.outbounds += [{"tag":"out-v4","protocol":"freedom","sendThrough":$ip}]')
+        else
+            config=$(echo "$config" | jq \
+                '.outbounds += [{"tag":"out-v4","protocol":"freedom"}]')
+        fi
+        config=$(echo "$config" | jq --argjson tags "$v4_tags" \
+            '.routing.rules += [{"type":"field","inboundTag":$tags,"outboundTag":"out-v4"}]')
+    fi
+    if [ "$v6_count" -gt 0 ] && [ -n "$PUBLIC_IP6" ]; then
+        if ip addr show 2>/dev/null | grep -qw "$PUBLIC_IP6"; then
+            config=$(echo "$config" | jq --arg ip "$PUBLIC_IP6" \
+                '.outbounds += [{"tag":"out-v6","protocol":"freedom","sendThrough":$ip}]')
+        else
+            config=$(echo "$config" | jq \
+                '.outbounds += [{"tag":"out-v6","protocol":"freedom"}]')
+        fi
+        config=$(echo "$config" | jq --argjson tags "$v6_tags" \
+            '.routing.rules += [{"type":"field","inboundTag":$tags,"outboundTag":"out-v6"}]')
+    fi
+
+    # 兜底：如果没有匹配到任何 outbound（NAT 模式等），加默认 freedom
+    local ob_count=$(echo "$config" | jq '.outbounds | length')
+    if [ "$ob_count" -eq 0 ]; then
+        config=$(echo "$config" | jq '.outbounds += [{"protocol":"freedom"}]')
+    fi
 
     echo "$config" | jq '.' > "$XRAY_CONF"
 }
@@ -323,6 +440,11 @@ rebuild_config() {
 
 add_vless() {
     echo -e "\n${B}━━━ 添加 VLESS+Reality 节点 ━━━${N}\n"
+
+    # 选择 IP 版本
+    local ip_info=$(choose_ip)
+    local ipver=$(echo "$ip_info" | cut -d'|' -f1)
+    local default_ip=$(echo "$ip_info" | cut -d'|' -f2)
 
     local port=$(read_port)
 
@@ -350,8 +472,8 @@ add_vless() {
     local ext_ip=$(echo "$nat_info" | cut -d'|' -f1)
     local ext_port=$(echo "$nat_info" | cut -d'|' -f2)
 
-    # 写入 nodes.txt
-    echo "vless|$port|$uuid|xtls-rprx-vision|$sni|$privkey|$pubkey|$shortid|$remark|$ext_ip|$ext_port" >> "$NODES_DB"
+    # 写入 nodes.txt（新增 ipver 字段）
+    echo "vless|$port|$uuid|xtls-rprx-vision|$sni|$privkey|$pubkey|$shortid|$remark|$ipver|$ext_ip|$ext_port" >> "$NODES_DB"
 
     # 重建配置 + 防火墙 + 重启
     rebuild_config
@@ -359,19 +481,21 @@ add_vless() {
     restart_xray
 
     # 生成链接用的 IP 和端口
-    local link_ip="${ext_ip:-$PUBLIC_IP}"
+    local link_ip="${ext_ip:-$default_ip}"
     local link_port="${ext_port:-$port}"
+    local link_host=$(fmt_host "$link_ip" "$link_port")
 
     echo ""
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
     msg "节点创建成功！"
+    echo -e "  IP版本: ${B}IPv${ipver}${N}"
     echo -e "  端口:   ${B}$port${N}"
     echo -e "  UUID:   ${B}$uuid${N}"
     echo -e "  SNI:    ${B}$sni${N}"
     [ -n "$ext_ip" ] && echo -e "  外部:   ${B}$ext_ip:$ext_port → 内部 $port${N}"
     echo ""
     echo -e "  客户端链接:"
-    echo -e "  ${G}vless://${uuid}@${link_ip}:${link_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pubkey}&sid=${shortid}&spx=%2F&type=tcp#${remark}${N}"
+    echo -e "  ${G}vless://${uuid}@${link_host}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pubkey}&sid=${shortid}&spx=%2F&type=tcp#${remark}${N}"
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
 }
 
@@ -381,6 +505,11 @@ add_vless() {
 
 add_ss() {
     echo -e "\n${B}━━━ 添加 Shadowsocks 节点 ━━━${N}\n"
+
+    # 选择 IP 版本
+    local ip_info=$(choose_ip)
+    local ipver=$(echo "$ip_info" | cut -d'|' -f1)
+    local default_ip=$(echo "$ip_info" | cut -d'|' -f2)
 
     local port=$(read_port)
 
@@ -398,8 +527,8 @@ add_ss() {
     local ext_ip=$(echo "$nat_info" | cut -d'|' -f1)
     local ext_port=$(echo "$nat_info" | cut -d'|' -f2)
 
-    # 写入 nodes.txt
-    echo "ss|$port|$method|$password|$remark|$ext_ip|$ext_port" >> "$NODES_DB"
+    # 写入 nodes.txt（新增 ipver 字段）
+    echo "ss|$port|$method|$password|$remark|$ipver|$ext_ip|$ext_port" >> "$NODES_DB"
 
     # 重建配置 + 防火墙 + 重启
     rebuild_config
@@ -407,13 +536,15 @@ add_ss() {
     restart_xray
 
     # 生成链接用的 IP 和端口
-    local link_ip="${ext_ip:-$PUBLIC_IP}"
+    local link_ip="${ext_ip:-$default_ip}"
     local link_port="${ext_port:-$port}"
-    local ss_link=$(printf "%s:%s@%s:%s" "$method" "$password" "$link_ip" "$link_port" | b64_encode)
+    local link_host=$(fmt_host "$link_ip" "$link_port")
+    local ss_link=$(printf "%s:%s@%s" "$method" "$password" "$link_host" | b64_encode)
 
     echo ""
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
     msg "节点创建成功！"
+    echo -e "  IP版本:   ${B}IPv${ipver}${N}"
     echo -e "  端口:     ${B}$port${N}"
     echo -e "  加密方式: ${B}$method${N}"
     echo -e "  密码:     ${B}$password${N}"
@@ -439,20 +570,37 @@ list_nodes() {
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
 
     local i=1
-    while IFS='|' read -r type port f3 f4 f5 f6 f7 f8 f9 f10 f11; do
-        local link_ip="${f10:-$PUBLIC_IP}"
-        local link_port="${f11:-$port}"
+    while IFS='|' read -r type port f3 f4 f5 f6 f7 f8 f9 f10 f11 f12; do
+        local ipver="4" ext_ip="" ext_port="" link_ip="" link_port=""
 
         if [ "$type" = "vless" ]; then
-            echo -e "  ${G}$i${N}. ${B}[VLESS+Reality]${N} $f9"
+            # 新格式: f10=ipver, f11=ext_ip, f12=ext_port
+            if [ "$f10" = "4" ] || [ "$f10" = "6" ]; then
+                ipver="$f10"; ext_ip="$f11"; ext_port="$f12"
+            else
+                ext_ip="$f10"; ext_port="$f11"
+            fi
+            link_ip="${ext_ip:-$PUBLIC_IP}"
+            link_port="${ext_port:-$port}"
+            local link_host=$(fmt_host "$link_ip" "$link_port")
+            echo -e "  ${G}$i${N}. ${B}[VLESS+Reality]${N} $f9 ${Y}(IPv${ipver})${N}"
             echo -e "     端口: $port | SNI: $f5"
-            [ -n "$f10" ] && echo -e "     NAT:  $f10:$f11 → 内部 $port"
-            echo -e "     链接: vless://${f3}@${link_ip}:${link_port}?encryption=none&flow=${f4}&security=reality&sni=${f5}&fp=chrome&pbk=${f7}&sid=${f8}&spx=%2F&type=tcp#${f9}"
+            [ -n "$ext_ip" ] && echo -e "     NAT:  $ext_ip:$ext_port → 内部 $port"
+            echo -e "     链接: vless://${f3}@${link_host}?encryption=none&flow=${f4}&security=reality&sni=${f5}&fp=chrome&pbk=${f7}&sid=${f8}&spx=%2F&type=tcp#${f9}"
         elif [ "$type" = "ss" ]; then
-            local ss_link=$(printf "%s:%s@%s:%s" "$f3" "$f4" "$link_ip" "$link_port" | b64_encode)
-            echo -e "  ${G}$i${N}. ${B}[Shadowsocks]${N} $f5"
+            # 新格式: f6=ipver, f7=ext_ip, f8=ext_port
+            if [ "$f6" = "4" ] || [ "$f6" = "6" ]; then
+                ipver="$f6"; ext_ip="$f7"; ext_port="$f8"
+            else
+                ext_ip="$f6"; ext_port="$f7"
+            fi
+            link_ip="${ext_ip:-$PUBLIC_IP}"
+            link_port="${ext_port:-$port}"
+            local link_host=$(fmt_host "$link_ip" "$link_port")
+            local ss_link=$(printf "%s:%s@%s" "$f3" "$f4" "$link_host" | b64_encode)
+            echo -e "  ${G}$i${N}. ${B}[Shadowsocks]${N} $f5 ${Y}(IPv${ipver})${N}"
             echo -e "     端口: $port | 加密: $f3"
-            [ -n "$f10" ] && echo -e "     NAT:  $f10:$f11 → 内部 $port"
+            [ -n "$ext_ip" ] && echo -e "     NAT:  $ext_ip:$ext_port → 内部 $port"
             echo -e "     链接: ss://${ss_link}#${f5}"
         fi
         ((i++))
@@ -557,14 +705,29 @@ export_links() {
     echo -e "${B}所有节点链接:${N}"
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
 
-    while IFS='|' read -r type port f3 f4 f5 f6 f7 f8 f9 f10 f11; do
-        local link_ip="${f10:-$PUBLIC_IP}"
-        local link_port="${f11:-$port}"
+    while IFS='|' read -r type port f3 f4 f5 f6 f7 f8 f9 f10 f11 f12; do
+        local ext_ip="" ext_port="" link_ip="" link_port=""
 
         if [ "$type" = "vless" ]; then
-            echo "vless://${f3}@${link_ip}:${link_port}?encryption=none&flow=${f4}&security=reality&sni=${f5}&fp=chrome&pbk=${f7}&sid=${f8}&spx=%2F&type=tcp#${f9}"
+            if [ "$f10" = "4" ] || [ "$f10" = "6" ]; then
+                ext_ip="$f11"; ext_port="$f12"
+            else
+                ext_ip="$f10"; ext_port="$f11"
+            fi
+            link_ip="${ext_ip:-$PUBLIC_IP}"
+            link_port="${ext_port:-$port}"
+            local link_host=$(fmt_host "$link_ip" "$link_port")
+            echo "vless://${f3}@${link_host}?encryption=none&flow=${f4}&security=reality&sni=${f5}&fp=chrome&pbk=${f7}&sid=${f8}&spx=%2F&type=tcp#${f9}"
         elif [ "$type" = "ss" ]; then
-            local ss_link=$(printf "%s:%s@%s:%s" "$f3" "$f4" "$link_ip" "$link_port" | b64_encode)
+            if [ "$f6" = "4" ] || [ "$f6" = "6" ]; then
+                ext_ip="$f7"; ext_port="$f8"
+            else
+                ext_ip="$f6"; ext_port="$f7"
+            fi
+            link_ip="${ext_ip:-$PUBLIC_IP}"
+            link_port="${ext_port:-$port}"
+            local link_host=$(fmt_host "$link_ip" "$link_port")
+            local ss_link=$(printf "%s:%s@%s" "$f3" "$f4" "$link_host" | b64_encode)
             echo "ss://${ss_link}#${f5}"
         fi
     done < "$NODES_DB"
@@ -885,8 +1048,32 @@ main() {
     check_deps
     install_shortcut
 
-    # 兼容旧版 nodes.txt（没有 ext_ip/ext_port 字段）
+    # 兼容旧版 nodes.txt：为没有 ipver 字段的行插入 "4" 到 remark 后面
+    # 正确格式: vless|...|remark|ipver|ext_ip|ext_port
+    # 旧格式:   vless|...|remark|ext_ip|ext_port (缺 ipver)
     if [ -f "$NODES_DB" ] && [ -s "$NODES_DB" ]; then
+        local migrated=false
+        while IFS= read -r line; do
+            local field_count=$(echo "$line" | awk -F'|' '{print NF}')
+            if [[ "$line" == vless* ]] && [ "$field_count" -eq 11 ]; then
+                # 在 field 9 (remark) 后插入 "4"：fields 1-9 | 4 | fields 10-11
+                echo "$line" | awk -F'|' -v OFS='|' '{print $1,$2,$3,$4,$5,$6,$7,$8,$9,"4",$10,$11}' >> "${NODES_DB}.new"
+                migrated=true
+            elif [[ "$line" == ss* ]] && [ "$field_count" -eq 7 ]; then
+                # 在 field 5 (remark) 后插入 "4"：fields 1-5 | 4 | fields 6-7
+                echo "$line" | awk -F'|' -v OFS='|' '{print $1,$2,$3,$4,$5,"4",$6,$7}' >> "${NODES_DB}.new"
+                migrated=true
+            else
+                echo "$line" >> "${NODES_DB}.new"
+            fi
+        done < "$NODES_DB"
+        if [ "$migrated" = true ]; then
+            mv "${NODES_DB}.new" "$NODES_DB"
+            msg "已迁移旧版节点数据（补充 IPv4 版本字段）"
+        else
+            rm -f "${NODES_DB}.new"
+        fi
+        # 清理旧版遗留的尾部空管道符
         sed -i '/^vless|/s/|$//' "$NODES_DB" 2>/dev/null
     fi
 
