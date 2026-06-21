@@ -806,23 +806,176 @@ uninstall() {
 # ============================================
 
 BBR_CONF="/etc/sysctl.d/99-bbr-xray.conf"
+BBR_MODULES_CONF="/etc/modules-load.d/99-xray-bbr.conf"
+BBR_BACKUP_PREFIX="xray-bbr-backup"
+BBR_SYSCTL_MARK="xray-bbr-disabled"
+
+list_network_ifaces() {
+    local iface_path iface operstate
+
+    for iface_path in /sys/class/net/*; do
+        [ -e "$iface_path" ] || continue
+        iface="${iface_path##*/}"
+        [ "$iface" = "lo" ] && continue
+
+        operstate=""
+        if [ -r "$iface_path/operstate" ]; then
+            read -r operstate < "$iface_path/operstate"
+        fi
+
+        case "$operstate" in
+            down|dormant|lowerlayerdown|notpresent) continue ;;
+        esac
+
+        printf "%s\n" "$iface"
+    done
+}
+
+root_qdisc_of() {
+    command -v tc >/dev/null 2>&1 || return 1
+    tc qdisc show dev "$1" 2>/dev/null | awk 'NR==1 {print $2}'
+}
+
+list_qdisc_ifaces() {
+    local iface qdisc
+
+    for iface in $(list_network_ifaces); do
+        qdisc=$(root_qdisc_of "$iface")
+        [ -z "$qdisc" ] && continue
+        [ "$qdisc" = "noqueue" ] && continue
+        printf "%s\n" "$iface"
+    done
+}
+
+default_route_iface() {
+    local iface=""
+
+    if command -v ip >/dev/null 2>&1; then
+        iface=$(ip route show default 2>/dev/null | awk 'NR==1 {for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')
+    fi
+
+    if [ -n "$iface" ]; then
+        printf "%s\n" "$iface"
+        return
+    fi
+
+    list_qdisc_ifaces | head -1
+}
+
+first_live_qdisc() {
+    local iface qdisc
+
+    iface=$(default_route_iface)
+    if [ -n "$iface" ]; then
+        qdisc=$(root_qdisc_of "$iface")
+        [ -n "$qdisc" ] && printf "%s\n" "$qdisc"
+    fi
+}
+
+live_qdisc_matches() {
+    local expected="$1" iface qdisc found=0
+
+    command -v tc >/dev/null 2>&1 || return 1
+    for iface in $(list_qdisc_ifaces); do
+        found=1
+        qdisc=$(root_qdisc_of "$iface")
+        [ "$qdisc" = "$expected" ] || return 1
+    done
+
+    [ "$found" -eq 1 ]
+}
+
+apply_live_qdisc() {
+    local target="$1" iface found=0 failed=0
+
+    if ! command -v tc >/dev/null 2>&1; then
+        warn "未找到 tc 命令，无法立即切换当前网卡 qdisc；重启网卡或系统后会使用 sysctl 默认值"
+        return 1
+    fi
+
+    for iface in $(list_qdisc_ifaces); do
+        found=1
+        if tc qdisc replace dev "$iface" root "$target" 2>/dev/null; then
+            msg "网卡 $iface 当前 qdisc 已切换为 $target"
+        else
+            warn "网卡 $iface 切换 qdisc 到 $target 失败，保持当前设置"
+            failed=1
+        fi
+    done
+
+    if [ "$found" -eq 0 ]; then
+        warn "未找到可切换 root qdisc 的非 lo 网卡"
+        return 1
+    fi
+
+    return "$failed"
+}
+
+show_live_qdisc() {
+    local iface qdisc printed=0
+
+    if ! command -v tc >/dev/null 2>&1; then
+        echo -e "  当前网卡队列: ${Y}无法检测（tc 未安装）${N}"
+        return
+    fi
+
+    for iface in $(list_network_ifaces); do
+        qdisc=$(root_qdisc_of "$iface")
+        [ -z "$qdisc" ] && continue
+        printed=1
+        echo -e "  网卡 $iface 队列: ${B}$qdisc${N}"
+    done
+
+    [ "$printed" -eq 0 ] && echo -e "  当前网卡队列: ${Y}未检测到${N}"
+}
+
+write_bbr_conf() {
+    local backup_qdisc="$1" backup_cc="$2" backup_live_qdisc="$3" backup_line=""
+    local legacy_values="" legacy_qdisc="" legacy_cc="" legacy_live_qdisc=""
+
+    if [ -f "$BBR_CONF" ]; then
+        backup_line=$(head -1 "$BBR_CONF" 2>/dev/null)
+    fi
+
+    if [[ "$backup_line" =~ ^#${BBR_BACKUP_PREFIX}: ]]; then
+        :
+    elif [[ "$backup_line" == \#*:* ]]; then
+        legacy_values="${backup_line#\#}"
+        legacy_qdisc=$(echo "$legacy_values" | cut -d: -f1)
+        legacy_cc=$(echo "$legacy_values" | cut -d: -f2)
+        legacy_live_qdisc=$(echo "$legacy_values" | cut -d: -f3)
+
+        case "$legacy_qdisc" in ""|*[!A-Za-z0-9_-]*) legacy_qdisc="$backup_qdisc" ;; esac
+        case "$legacy_cc" in ""|*[!A-Za-z0-9_-]*) legacy_cc="$backup_cc" ;; esac
+        case "$legacy_live_qdisc" in ""|*[!A-Za-z0-9_-]*) legacy_live_qdisc="${backup_live_qdisc:-$legacy_qdisc}" ;; esac
+        backup_line="#${BBR_BACKUP_PREFIX}:${legacy_qdisc}:${legacy_cc}:${legacy_live_qdisc}"
+    else
+        backup_line="#${BBR_BACKUP_PREFIX}:${backup_qdisc}:${backup_cc}:${backup_live_qdisc}"
+    fi
+
+    printf "%s\n" "$backup_line" > "$BBR_CONF"
+    printf "net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n" >> "$BBR_CONF"
+}
 
 enable_bbr() {
     echo -e "\n${B}━━━ 启用 BBR 加速 ━━━${N}\n"
 
-    # 检查当前状态（同时接受 fq 和 cake）
+    # 检查当前状态：sysctl 默认值不等于当前网卡真实 qdisc，必须同时验证
     local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    local current_live_qdisc=$(first_live_qdisc)
 
-    if [[ "$current_cc" == "bbr" ]] && [[ "$current_qdisc" =~ ^(fq|cake)$ ]]; then
+    if [[ "$current_cc" == "bbr" ]] && [[ "$current_qdisc" == "fq" ]] && live_qdisc_matches fq; then
         msg "BBR 已启用，无需重复操作"
         echo -e "  当前拥塞控制: ${B}$current_cc${N}"
-        echo -e "  当前队列算法: ${B}$current_qdisc${N}"
+        echo -e "  默认队列算法: ${B}$current_qdisc${N}"
+        show_live_qdisc
         return
     fi
 
     echo -e "  当前拥塞控制: ${Y}${current_cc:-未设置}${N}"
-    echo -e "  当前队列算法: ${Y}${current_qdisc:-未设置}${N}"
+    echo -e "  默认队列算法: ${Y}${current_qdisc:-未设置}${N}"
+    show_live_qdisc
     echo ""
 
     # 检查内核版本（BBR 需要 4.9+）
@@ -842,46 +995,49 @@ enable_bbr() {
     fi
     msg "tcp_bbr 模块已加载"
 
-    # 确保 bbr 开机自动加载
-    if ! grep -q "tcp_bbr" /etc/modules-load.d/bbr.conf 2>/dev/null; then
-        printf "tcp_bbr\n" > /etc/modules-load.d/bbr.conf
-    fi
+    # 确保 bbr 开机自动加载；使用脚本专属文件，避免覆盖用户已有 modules-load 配置
+    printf "tcp_bbr\n" > "$BBR_MODULES_CONF"
 
     # 持久化写入
     if [ -d /etc/sysctl.d ]; then
         # 保存旧值到注释行，供 disable_bbr 回滚
-        printf "#%s:%s\n" "$current_qdisc" "$current_cc" > "$BBR_CONF"
-        printf "net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n" >> "$BBR_CONF"
+        write_bbr_conf "$current_qdisc" "$current_cc" "$current_live_qdisc"
 
         # 注释掉 /etc/sysctl.conf 中已有的冲突行，避免两个文件打架
         if [ -f /etc/sysctl.conf ]; then
-            sed -i -E 's/^[[:space:]]*(net\.core\.default_qdisc)/#&/' /etc/sysctl.conf
-            sed -i -E 's/^[[:space:]]*(net\.ipv4\.tcp_congestion_control)/#&/' /etc/sysctl.conf
+            sed -i -E "s/^[[:space:]]*(net\.core\.default_qdisc[[:space:]]*=.*)$/# ${BBR_SYSCTL_MARK} \1/" /etc/sysctl.conf
+            sed -i -E "s/^[[:space:]]*(net\.ipv4\.tcp_congestion_control[[:space:]]*=.*)$/# ${BBR_SYSCTL_MARK} \1/" /etc/sysctl.conf
         fi
 
         sysctl --system &>/dev/null
     else
-        # 没有 sysctl.d 的老系统，直接写 sysctl.conf
-        sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-        sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-        printf "net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n" >> /etc/sysctl.conf
+        # 没有 sysctl.d 的老系统，直接写 sysctl.conf；只标记和管理本脚本写入的配置
+        if [ -f /etc/sysctl.conf ]; then
+            sed -i -E "s/^[[:space:]]*(net\.core\.default_qdisc[[:space:]]*=.*)$/# ${BBR_SYSCTL_MARK} \1/" /etc/sysctl.conf
+            sed -i -E "s/^[[:space:]]*(net\.ipv4\.tcp_congestion_control[[:space:]]*=.*)$/# ${BBR_SYSCTL_MARK} \1/" /etc/sysctl.conf
+        fi
+        printf "# ${BBR_SYSCTL_MARK} begin\nnet.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n# ${BBR_SYSCTL_MARK} end\n" >> /etc/sysctl.conf
         sysctl -p &>/dev/null
     fi
+
+    # sysctl 只影响默认值，不会自动替换当前网卡已挂载的 root qdisc
+    apply_live_qdisc fq || true
 
     # 验证
     local new_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     local new_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
 
-    if [[ "$new_cc" == "bbr" ]]; then
+    if [[ "$new_cc" == "bbr" ]] && [[ "$new_qdisc" == "fq" ]] && live_qdisc_matches fq; then
         echo ""
         echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
         msg "BBR 加速已启用！"
         echo -e "  拥塞控制: ${B}$new_cc${N}"
-        echo -e "  队列算法: ${B}$new_qdisc${N}"
+        echo -e "  默认队列算法: ${B}$new_qdisc${N}"
+        show_live_qdisc
         echo -e "  持久化:   ${B}${BBR_CONF}${N}"
         echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
     else
-        err "BBR 启用失败，请检查内核是否支持"
+        err "BBR 启用不完整，请检查内核、tc 命令和当前网卡 qdisc"
     fi
 }
 
@@ -891,8 +1047,9 @@ disable_bbr() {
     # 检查当前状态
     local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    local restore_live_qdisc=""
 
-    if [[ "$current_cc" != "bbr" ]] && [[ "$current_qdisc" != "fq" && "$current_qdisc" != "cake" ]]; then
+    if [[ "$current_cc" != "bbr" ]] && [[ "$current_qdisc" != "fq" ]] && ! live_qdisc_matches fq && [ ! -f "$BBR_CONF" ]; then
         msg "BBR 未启用，无需操作"
         return
     fi
@@ -900,42 +1057,58 @@ disable_bbr() {
     if [ -f "$BBR_CONF" ]; then
         # 从注释行读取旧值回滚
         local old_values=$(head -1 "$BBR_CONF" | sed 's/^#//')
-        local old_qdisc=$(echo "$old_values" | cut -d: -f1)
-        local old_cc=$(echo "$old_values" | cut -d: -f2)
+        local old_qdisc=""
+        local old_cc=""
+        local old_live_qdisc=""
 
-        old_qdisc="${old_qdisc:-cubic}"
-        old_cc="${old_cc:-pfifo_fast}"
+        if [[ "$old_values" == ${BBR_BACKUP_PREFIX}:* ]]; then
+            old_qdisc=$(echo "$old_values" | cut -d: -f2)
+            old_cc=$(echo "$old_values" | cut -d: -f3)
+            old_live_qdisc=$(echo "$old_values" | cut -d: -f4)
+        else
+            old_qdisc=$(echo "$old_values" | cut -d: -f1)
+            old_cc=$(echo "$old_values" | cut -d: -f2)
+            old_live_qdisc=$(echo "$old_values" | cut -d: -f3)
+        fi
 
-        msg "恢复原始设置: 拥塞控制=$old_cc, 队列算法=$old_qdisc"
+        case "$old_qdisc" in ""|*[!A-Za-z0-9_-]*) old_qdisc="pfifo_fast" ;; esac
+        case "$old_cc" in ""|*[!A-Za-z0-9_-]*) old_cc="cubic" ;; esac
+        case "$old_live_qdisc" in ""|*[!A-Za-z0-9_-]*) old_live_qdisc="$old_qdisc" ;; esac
+        restore_live_qdisc="$old_live_qdisc"
+
+        msg "恢复原始设置: 拥塞控制=$old_cc, 默认队列算法=$old_qdisc, 当前网卡队列=$old_live_qdisc"
 
         # 删除 BBR 配置文件
         rm -f "$BBR_CONF"
 
-        # 恢复 /etc/sysctl.conf 中被注释的行
+        # 只恢复本脚本启用 BBR 时加标记注释的行，避免误启用用户原本手动注释的配置
         if [ -f /etc/sysctl.conf ]; then
-            sed -i -E 's/^#[[:space:]]*(net\.core\.default_qdisc)/\1/' /etc/sysctl.conf
-            sed -i -E 's/^#[[:space:]]*(net\.ipv4\.tcp_congestion_control)/\1/' /etc/sysctl.conf
+            sed -i -E "/^#[[:space:]]*${BBR_SYSCTL_MARK}[[:space:]]+begin$/,/^#[[:space:]]*${BBR_SYSCTL_MARK}[[:space:]]+end$/d" /etc/sysctl.conf
+            sed -i -E "s/^#[[:space:]]*${BBR_SYSCTL_MARK}[[:space:]]+(net\.core\.default_qdisc[[:space:]]*=.*)$/\1/" /etc/sysctl.conf
+            sed -i -E "s/^#[[:space:]]*${BBR_SYSCTL_MARK}[[:space:]]+(net\.ipv4\.tcp_congestion_control[[:space:]]*=.*)$/\1/" /etc/sysctl.conf
         fi
 
         sysctl -w net.core.default_qdisc="$old_qdisc" &>/dev/null
         sysctl -w net.ipv4.tcp_congestion_control="$old_cc" &>/dev/null
         sysctl --system &>/dev/null
     else
-        # 没有保存旧值，回退到默认 cubic + pfifo_fast
-        warn "未找到 BBR 配置备份，恢复为默认值 (cubic + pfifo_fast)"
+        # 没有脚本备份时，不强制回退用户当前 BBR/sysctl/qdisc 设置，只清理本脚本标记过的配置
+        warn "未找到 BBR 配置备份，仅清理本脚本标记的配置；未修改当前 sysctl/qdisc 运行状态"
 
         if [ -f /etc/sysctl.conf ]; then
-            sed -i 's/net\.core\.default_qdisc=fq/net.core.default_qdisc=pfifo_fast/' /etc/sysctl.conf
-            sed -i 's/net\.ipv4\.tcp_congestion_control=bbr/net.ipv4.tcp_congestion_control=cubic/' /etc/sctl.conf 2>/dev/null
+            sed -i -E "/^#[[:space:]]*${BBR_SYSCTL_MARK}[[:space:]]+begin$/,/^#[[:space:]]*${BBR_SYSCTL_MARK}[[:space:]]+end$/d" /etc/sysctl.conf
+            sed -i -E "s/^#[[:space:]]*${BBR_SYSCTL_MARK}[[:space:]]+(net\.core\.default_qdisc[[:space:]]*=.*)$/\1/" /etc/sysctl.conf
+            sed -i -E "s/^#[[:space:]]*${BBR_SYSCTL_MARK}[[:space:]]+(net\.ipv4\.tcp_congestion_control[[:space:]]*=.*)$/\1/" /etc/sysctl.conf
         fi
 
-        sysctl -w net.core.default_qdisc=pfifo_fast &>/dev/null
-        sysctl -w net.ipv4.tcp_congestion_control=cubic &>/dev/null
         sysctl --system &>/dev/null || sysctl -p &>/dev/null
     fi
 
-    # 移除模块开机自加载
-    rm -f /etc/modules-load.d/bbr.conf
+    # sysctl 只恢复默认值，不会自动替换当前网卡已挂载的 root qdisc
+    [ -n "$restore_live_qdisc" ] && apply_live_qdisc "$restore_live_qdisc" || true
+
+    # 移除本脚本创建的模块开机自加载配置，不触碰用户自己的 modules-load 文件
+    rm -f "$BBR_MODULES_CONF"
 
     # 验证
     local new_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
@@ -946,7 +1119,8 @@ disable_bbr() {
         echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
         msg "BBR 已关闭！"
         echo -e "  拥塞控制: ${B}$new_cc${N}"
-        echo -e "  队列算法: ${B}$new_qdisc${N}"
+        echo -e "  默认队列算法: ${B}$new_qdisc${N}"
+        show_live_qdisc
         echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
     else
         err "BBR 关闭失败，请手动检查 sysctl 配置"
@@ -958,7 +1132,8 @@ bbr_menu() {
 
     local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
-    echo -e "  当前状态: 拥塞控制=${B}$current_cc${N}, 队列算法=${B}$current_qdisc${N}"
+    echo -e "  当前状态: 拥塞控制=${B}$current_cc${N}, 默认队列算法=${B}$current_qdisc${N}"
+    show_live_qdisc
     echo ""
     echo -e "  ${B}1.${N} 启用 BBR"
     echo -e "  ${B}2.${N} 关闭 BBR"
