@@ -1,5 +1,11 @@
 # Progress
 
+## 2026-06-25
+
+- Changed the VLESS Reality default SNI in `xray-manager.sh` from `www.microsoft.com` to `www.sony.com` because the Microsoft SNI path recently became unreliable.
+- Verified the change with `bash -n xray-manager.sh`, `git diff --check`, targeted string search, and code review.
+- Existing nodes are unaffected because persisted SNI values remain stored in `/usr/local/etc/xray/nodes.txt`; only newly created VLESS nodes use the new default when the prompt is left blank.
+
 ## 2026-06-21
 
 - Cloned `masatoshiyokoyama635-sudo/vps-scripts` into `E:/vis project/vps_scripts`.

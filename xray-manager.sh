@@ -460,7 +460,7 @@ add_vless() {
         return 1
     fi
 
-    local default_sni="www.microsoft.com"
+    local default_sni="www.sony.com"
     read -p "伪装域名 [回车默认 $default_sni]: " sni
     sni="${sni:-$default_sni}"
 
