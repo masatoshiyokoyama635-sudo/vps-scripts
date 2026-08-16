@@ -1,5 +1,14 @@
 # Progress
 
+## 2026-08-16
+
+- Added persistent HTTP Basic Auth inbound support to `xray-manager.sh` while retaining VLESS Reality and Shadowsocks.
+- HTTP records use `http|port|username|password|remark|ipver|ext_ip|ext_port`; HTTP ports are generated in the high range and checked against system listeners and existing node records.
+- Rebuilds now validate node types/ports, generate `settings.users`, test candidate Xray configuration when the binary is available, and atomically replace the config only after validation. Existing configuration is preserved on malformed records.
+- Added HTTP menu/list/export/port-management paths, credential validation, node-data permissions, and a feature marker to prevent `install_shortcut()` from silently installing an older script without HTTP support.
+- HTTP credentials are now generated automatically: usernames use a random 16-hex suffix and passwords use 24 random hex bytes (48 characters); no manual credential input is required.
+- `bash -n`, `git diff --check`, and Xray 26.3.27 `run -test` against a minimal HTTP configuration passed. Full script rebuild testing is blocked locally because Git Bash does not provide `jq` or Linux `ss`; run the mixed VLESS/SS/HTTP regression on a disposable Linux VPS before deployment.
+
 ## 2026-06-25
 
 - Changed the VLESS Reality default SNI in `xray-manager.sh` from `www.microsoft.com` to `www.sony.com` because the Microsoft SNI path recently became unreliable.

@@ -2,14 +2,16 @@
 # ============================================
 #   Xray 节点管理脚本 (多系统兼容版)
 #   支持: Ubuntu/Debian, Alpine, CentOS/Rocky
-#   支持: VLESS+Reality+TCP / Shadowsocks
+#   支持: VLESS+Reality+TCP / Shadowsocks / HTTP Basic Auth
 #   支持: NAT 小鸡
 #   支持: BBR 加速
+#   Feature: http-basic-auth
 # ============================================
 
 # ---- 配置 ----
 XRAY_CONF="/usr/local/etc/xray/config.json"
 NODES_DB="/usr/local/etc/xray/nodes.txt"
+SCRIPT_FEATURE="http-basic-auth"
 PUBLIC_IP=""
 PUBLIC_IP6=""
 NAT_MODE=false
@@ -144,7 +146,14 @@ check_deps() {
         setup_xray_service
     fi
 
-    mkdir -p /usr/local/etc/xray
+    mkdir -p /usr/local/etc/xray || {
+        err "无法创建 Xray 数据目录"
+        exit 1
+    }
+    set_xray_permissions "$XRAY_CONF" || {
+        err "无法设置 Xray 数据目录权限"
+        exit 1
+    }
 }
 
 # ============================================
@@ -188,7 +197,41 @@ svc_disable() {
 }
 
 restart_xray() {
-    svc_restart && msg "Xray 已重启" || err "Xray 重启失败"
+    if svc_restart; then
+        msg "Xray 已重启"
+        return 0
+    fi
+    err "Xray 重启失败"
+    return 1
+}
+
+set_xray_permissions() {
+    local config_file="${1:-}" service_user="" service_group=""
+
+    if [ "$SVC_TYPE" = "systemd" ]; then
+        service_user=$(systemctl show -p User --value xray 2>/dev/null)
+        service_group=$(systemctl show -p Group --value xray 2>/dev/null)
+        service_user="${service_user:-root}"
+        if [ "$service_user" != "root" ] && [ -z "$service_group" ]; then
+            service_group=$(id -gn "$service_user" 2>/dev/null)
+        fi
+    fi
+
+    if [ -n "$service_group" ]; then
+        chown root:"$service_group" /usr/local/etc/xray 2>/dev/null || return 1
+        chmod 750 /usr/local/etc/xray || return 1
+        if [ -n "$config_file" ] && [ -f "$config_file" ]; then
+            chown root:"$service_group" "$config_file" 2>/dev/null || return 1
+            chmod 640 "$config_file" || return 1
+        fi
+    else
+        chmod 700 /usr/local/etc/xray || return 1
+        if [ -n "$config_file" ] && [ -f "$config_file" ]; then
+            chmod 600 "$config_file" || return 1
+        fi
+    fi
+
+    [ -f "$NODES_DB" ] && chmod 600 "$NODES_DB" 2>/dev/null || true
 }
 
 # ============================================
@@ -196,6 +239,20 @@ restart_xray() {
 # ============================================
 
 port_used() { ss -tlnp 2>/dev/null | grep -qw ":$1 " && return 0 || return 1; }
+
+port_in_nodes() {
+    [ -f "$NODES_DB" ] || return 1
+    awk -F'|' -v port="$1" '$2 == port { found=1; exit } END { exit !found }' "$NODES_DB"
+}
+
+port_available() {
+    ! port_used "$1" && ! port_in_nodes "$1"
+}
+
+valid_db_field() {
+    local value="$1"
+    [[ -n "$value" && "$value" != *"|"* && "$value" != *$'\n'* && "$value" != *$'\r'* ]]
+}
 
 # base64 兼容（Alpine 不支持 -w0）
 b64_encode() { base64 | tr -d '\n'; }
@@ -212,15 +269,17 @@ fmt_host() {
 
 # 生成随机安全端口
 random_port() {
-    local port
+    local port random_hex
     while true; do
-        port=$((RANDOM % 50001 + 10000))
+        random_hex=$(openssl rand -hex 2 2>/dev/null) || continue
+        [ -n "$random_hex" ] || continue
+        port=$((16#$random_hex % 50001 + 10000))
         local blocked=false
         for bp in $BLOCKED_PORTS; do
             [ "$port" = "$bp" ] && blocked=true && break
         done
         $blocked && continue
-        port_used "$port" && continue
+        port_available "$port" || continue
         echo "$port"
         return
     done
@@ -242,7 +301,11 @@ read_port() {
             fi
         done
         if port_used "$port"; then
-            warn "端口 $port 已被占用"
+            warn "端口 $port 已被系统占用"
+            continue
+        fi
+        if port_in_nodes "$port"; then
+            warn "端口 $port 已被已有节点使用"
             continue
         fi
         echo "$port"
@@ -339,99 +402,189 @@ close_firewall() {
 # nodes.txt 格式:
 #   vless|port|uuid|flow|sni|privkey|pubkey|shortid|remark|ipver|ext_ip|ext_port
 #   ss|port|method|password|remark|ipver|ext_ip|ext_port
+#   http|port|username|password|remark|ipver|ext_ip|ext_port
 
 rebuild_config() {
-    if [ ! -f "$NODES_DB" ] || [ ! -s "$NODES_DB" ]; then
-        echo '{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"protocol":"freedom"}]}' | jq '.' > "$XRAY_CONF"
-        return
-    fi
-
     local config='{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[],"routing":{"domainStrategy":"AsIs","rules":[]}}'
-    local v4_tags="[]" v6_tags="[]"
+    local v4_tags="[]" v6_tags="[]" seen_ports=""
+    local tmp_conf="${XRAY_CONF}.tmp.$$"
 
-    while IFS='|' read -r _type _port _f3 _f4 _f5 _f6 _f7 _f8 _f9 _f10 _f11 _f12; do
-        [ -z "$_type" ] && continue
-        local _listen="0.0.0.0" _ipver="4" _tag=""
+    mkdir -p "$(dirname "$XRAY_CONF")" || {
+        err "无法创建 Xray 配置目录"
+        return 1
+    }
 
-        if [ "$_type" = "vless" ]; then
-            # 新格式: f10=ipver(4/6), f11=ext_ip, f12=ext_port
-            # 旧格式: f10=ext_ip, f11=ext_port, 无 ipver
-            if [ "$_f10" = "4" ] || [ "$_f10" = "6" ]; then
-                _ipver="$_f10"
-                [ "$_ipver" = "6" ] && _listen="::"
+    if [ ! -f "$NODES_DB" ] || [ ! -s "$NODES_DB" ]; then
+        config='{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"protocol":"freedom"}]}'
+    else
+        local line_no=0
+        while IFS='|' read -r _type _port _f3 _f4 _f5 _f6 _f7 _f8 _f9 _f10 _f11 _f12; do
+            line_no=$((line_no + 1))
+            [ -z "$_type" ] && continue
+
+            if ! [[ "$_port" =~ ^[0-9]+$ ]] || [ "$_port" -lt 1 ] || [ "$_port" -gt 65535 ]; then
+                err "nodes.txt 第 ${line_no} 行端口无效: $_port"
+                rm -f "$tmp_conf"
+                return 1
             fi
-            _tag="v${_ipver}-${_port}"
-            local inbound=$(jq -n \
-                --arg tag "$_tag" --arg listen "$_listen" \
-                --arg port "$_port" --arg uuid "$_f3" --arg flow "$_f4" \
-                --arg sni "$_f5" --arg privkey "$_f6" --arg shortid "$_f8" \
-                '{tag:$tag,listen:$listen,port:($port|tonumber),protocol:"vless",
-                  settings:{clients:[{id:$uuid,flow:$flow}],decryption:"none"},
-                  streamSettings:{network:"tcp",security:"reality",
-                    realitySettings:{dest:("\($sni):443"),serverNames:[$sni],
-                      privateKey:$privkey,shortIds:[$shortid]}}}')
-            config=$(echo "$config" | jq --argjson ib "$inbound" '.inbounds += [$ib]')
+            case "|$seen_ports|" in
+                *"|$_port|"*)
+                    err "nodes.txt 第 ${line_no} 行端口重复: $_port"
+                    rm -f "$tmp_conf"
+                    return 1
+                    ;;
+            esac
+            seen_ports="${seen_ports}|$_port"
 
-        elif [ "$_type" = "ss" ]; then
-            # 新格式: f6=ipver(4/6), f7=ext_ip, f8=ext_port
-            # 旧格式: f6=ext_ip, f7=ext_port, 无 ipver
-            if [ "$_f6" = "4" ] || [ "$_f6" = "6" ]; then
-                _ipver="$_f6"
-                [ "$_ipver" = "6" ] && _listen="::"
+            local _listen="0.0.0.0" _ipver="4" _tag=""
+            case "$_type" in
+                vless)
+                    # 新格式: f10=ipver(4/6), f11=ext_ip, f12=ext_port
+                    # 旧格式: f10=ext_ip, f11=ext_port, 无 ipver
+                    if [ "$_f10" = "4" ] || [ "$_f10" = "6" ]; then
+                        _ipver="$_f10"
+                        [ "$_ipver" = "6" ] && _listen="::"
+                    fi
+                    _tag="v${_ipver}-${_port}"
+                    local inbound=$(jq -n \
+                        --arg tag "$_tag" --arg listen "$_listen" \
+                        --arg port "$_port" --arg uuid "$_f3" --arg flow "$_f4" \
+                        --arg sni "$_f5" --arg privkey "$_f6" --arg shortid "$_f8" \
+                        '{tag:$tag,listen:$listen,port:($port|tonumber),protocol:"vless",
+                          settings:{clients:[{id:$uuid,flow:$flow}],decryption:"none"},
+                          streamSettings:{network:"tcp",security:"reality",
+                            realitySettings:{dest:("\($sni):443"),serverNames:[$sni],
+                              privateKey:$privkey,shortIds:[$shortid]}}}') || {
+                        err "无法生成 VLESS 配置（nodes.txt 第 ${line_no} 行）"
+                        rm -f "$tmp_conf"
+                        return 1
+                    }
+                    config=$(echo "$config" | jq --argjson ib "$inbound" '.inbounds += [$ib]') || {
+                        rm -f "$tmp_conf"
+                        return 1
+                    }
+                    ;;
+                ss)
+                    # 新格式: f6=ipver(4/6), f7=ext_ip, f8=ext_port
+                    # 旧格式: f6=ext_ip, f7=ext_port, 无 ipver
+                    if [ "$_f6" = "4" ] || [ "$_f6" = "6" ]; then
+                        _ipver="$_f6"
+                        [ "$_ipver" = "6" ] && _listen="::"
+                    fi
+                    _tag="v${_ipver}-${_port}"
+                    local inbound=$(jq -n \
+                        --arg tag "$_tag" --arg listen "$_listen" \
+                        --arg port "$_port" --arg method "$_f3" --arg password "$_f4" \
+                        '{tag:$tag,listen:$listen,port:($port|tonumber),protocol:"shadowsocks",
+                          settings:{method:$method,password:$password,network:"tcp,udp"}}') || {
+                        err "无法生成 Shadowsocks 配置（nodes.txt 第 ${line_no} 行）"
+                        rm -f "$tmp_conf"
+                        return 1
+                    }
+                    config=$(echo "$config" | jq --argjson ib "$inbound" '.inbounds += [$ib]') || {
+                        rm -f "$tmp_conf"
+                        return 1
+                    }
+                    ;;
+                http)
+                    # 新格式: f6=ipver(4/6), f7=ext_ip, f8=ext_port
+                    # 兼容无 ipver 的旧格式: f6=ext_ip, f7=ext_port
+                    if [ "$_f6" = "4" ] || [ "$_f6" = "6" ]; then
+                        _ipver="$_f6"
+                        [ "$_ipver" = "6" ] && _listen="::"
+                    fi
+                    if ! valid_db_field "$_f3" || ! valid_db_field "$_f4"; then
+                        err "nodes.txt 第 ${line_no} 行 HTTP 用户名或密码无效"
+                        rm -f "$tmp_conf"
+                        return 1
+                    fi
+                    _tag="http-${_ipver}-${_port}"
+                    local inbound=$(jq -n \
+                        --arg tag "$_tag" --arg listen "$_listen" \
+                        --arg port "$_port" --arg user "$_f3" --arg password "$_f4" \
+                        '{tag:$tag,listen:$listen,port:($port|tonumber),protocol:"http",
+                          settings:{users:[{user:$user,pass:$password}],allowTransparent:false}}') || {
+                        err "无法生成 HTTP 配置（nodes.txt 第 ${line_no} 行）"
+                        rm -f "$tmp_conf"
+                        return 1
+                    }
+                    config=$(echo "$config" | jq --argjson ib "$inbound" '.inbounds += [$ib]') || {
+                        rm -f "$tmp_conf"
+                        return 1
+                    }
+                    ;;
+                *)
+                    err "nodes.txt 第 ${line_no} 行存在未知节点类型: $_type"
+                    rm -f "$tmp_conf"
+                    return 1
+                    ;;
+            esac
+
+            if [ "$_ipver" = "6" ]; then
+                v6_tags=$(echo "$v6_tags" | jq --arg t "$_tag" '. += [$t]') || return 1
+            else
+                v4_tags=$(echo "$v4_tags" | jq --arg t "$_tag" '. += [$t]') || return 1
             fi
-            _tag="v${_ipver}-${_port}"
-            local inbound=$(jq -n \
-                --arg tag "$_tag" --arg listen "$_listen" \
-                --arg port "$_port" --arg method "$_f3" --arg password "$_f4" \
-                '{tag:$tag,listen:$listen,port:($port|tonumber),protocol:"shadowsocks",
-                  settings:{method:$method,password:$password,network:"tcp,udp"}}')
-            config=$(echo "$config" | jq --argjson ib "$inbound" '.inbounds += [$ib]')
-        else
-            continue
+        done < "$NODES_DB"
+
+        # 构建 outbound：用 sendThrough 绑定出口 IP，强制走对应 IP 版本
+        local v4_count=$(echo "$v4_tags" | jq 'length')
+        local v6_count=$(echo "$v6_tags" | jq 'length')
+
+        if [ "$v4_count" -gt 0 ] && [ -n "$PUBLIC_IP" ]; then
+            if ip addr show 2>/dev/null | grep -qw "$PUBLIC_IP"; then
+                config=$(echo "$config" | jq --arg ip "$PUBLIC_IP" \
+                    '.outbounds += [{"tag":"out-v4","protocol":"freedom","sendThrough":$ip}]')
+            else
+                config=$(echo "$config" | jq \
+                    '.outbounds += [{"tag":"out-v4","protocol":"freedom"}]')
+            fi
+            config=$(echo "$config" | jq --argjson tags "$v4_tags" \
+                '.routing.rules += [{"type":"field","inboundTag":$tags,"outboundTag":"out-v4"}]')
+        fi
+        if [ "$v6_count" -gt 0 ] && [ -n "$PUBLIC_IP6" ]; then
+            if ip addr show 2>/dev/null | grep -qw "$PUBLIC_IP6"; then
+                config=$(echo "$config" | jq --arg ip "$PUBLIC_IP6" \
+                    '.outbounds += [{"tag":"out-v6","protocol":"freedom","sendThrough":$ip}]')
+            else
+                config=$(echo "$config" | jq \
+                    '.outbounds += [{"tag":"out-v6","protocol":"freedom"}]')
+            fi
+            config=$(echo "$config" | jq --argjson tags "$v6_tags" \
+                '.routing.rules += [{"type":"field","inboundTag":$tags,"outboundTag":"out-v6"}]')
         fi
 
-        if [ "$_ipver" = "6" ]; then
-            v6_tags=$(echo "$v6_tags" | jq --arg t "$_tag" '. += [$t]')
-        else
-            v4_tags=$(echo "$v4_tags" | jq --arg t "$_tag" '. += [$t]')
+        # 兜底：如果没有匹配到任何 outbound（NAT 模式等），加默认 freedom
+        local ob_count=$(echo "$config" | jq '.outbounds | length')
+        if [ "$ob_count" -eq 0 ]; then
+            config=$(echo "$config" | jq '.outbounds += [{"protocol":"freedom"}]')
         fi
-    done < "$NODES_DB"
-
-    # 构建 outbound：用 sendThrough 绑定出口 IP，强制走对应 IP 版本
-    # 仅当公网 IP 存在于本机网卡时才使用 sendThrough（NAT/容器环境可能无此 IP）
-    local v4_count=$(echo "$v4_tags" | jq 'length')
-    local v6_count=$(echo "$v6_tags" | jq 'length')
-
-    if [ "$v4_count" -gt 0 ] && [ -n "$PUBLIC_IP" ]; then
-        if ip addr show 2>/dev/null | grep -qw "$PUBLIC_IP"; then
-            config=$(echo "$config" | jq --arg ip "$PUBLIC_IP" \
-                '.outbounds += [{"tag":"out-v4","protocol":"freedom","sendThrough":$ip}]')
-        else
-            config=$(echo "$config" | jq \
-                '.outbounds += [{"tag":"out-v4","protocol":"freedom"}]')
-        fi
-        config=$(echo "$config" | jq --argjson tags "$v4_tags" \
-            '.routing.rules += [{"type":"field","inboundTag":$tags,"outboundTag":"out-v4"}]')
-    fi
-    if [ "$v6_count" -gt 0 ] && [ -n "$PUBLIC_IP6" ]; then
-        if ip addr show 2>/dev/null | grep -qw "$PUBLIC_IP6"; then
-            config=$(echo "$config" | jq --arg ip "$PUBLIC_IP6" \
-                '.outbounds += [{"tag":"out-v6","protocol":"freedom","sendThrough":$ip}]')
-        else
-            config=$(echo "$config" | jq \
-                '.outbounds += [{"tag":"out-v6","protocol":"freedom"}]')
-        fi
-        config=$(echo "$config" | jq --argjson tags "$v6_tags" \
-            '.routing.rules += [{"type":"field","inboundTag":$tags,"outboundTag":"out-v6"}]')
     fi
 
-    # 兜底：如果没有匹配到任何 outbound（NAT 模式等），加默认 freedom
-    local ob_count=$(echo "$config" | jq '.outbounds | length')
-    if [ "$ob_count" -eq 0 ]; then
-        config=$(echo "$config" | jq '.outbounds += [{"protocol":"freedom"}]')
+    if ! echo "$config" | jq '.' > "$tmp_conf" || ! jq empty "$tmp_conf"; then
+        err "生成 Xray 配置失败，保留原配置"
+        rm -f "$tmp_conf"
+        return 1
     fi
-
-    echo "$config" | jq '.' > "$XRAY_CONF"
+    if command -v xray >/dev/null 2>&1 && ! xray run -test -config "$tmp_conf" >/dev/null 2>&1; then
+        err "Xray 配置测试失败，保留原配置"
+        rm -f "$tmp_conf"
+        return 1
+    fi
+    chmod 600 "$tmp_conf" || {
+        err "无法设置 Xray 配置权限"
+        rm -f "$tmp_conf"
+        return 1
+    }
+    mv -f "$tmp_conf" "$XRAY_CONF" || {
+        err "无法替换 Xray 配置"
+        rm -f "$tmp_conf"
+        return 1
+    }
+    if ! set_xray_permissions "$XRAY_CONF"; then
+        err "无法设置 Xray 配置目录权限"
+        return 1
+    fi
 }
 
 # ============================================
@@ -473,12 +626,21 @@ add_vless() {
     local ext_port=$(echo "$nat_info" | cut -d'|' -f2)
 
     # 写入 nodes.txt（新增 ipver 字段）
-    echo "vless|$port|$uuid|xtls-rprx-vision|$sni|$privkey|$pubkey|$shortid|$remark|$ipver|$ext_ip|$ext_port" >> "$NODES_DB"
+    local node_record="vless|$port|$uuid|xtls-rprx-vision|$sni|$privkey|$pubkey|$shortid|$remark|$ipver|$ext_ip|$ext_port"
+    printf '%s\n' "$node_record" >> "$NODES_DB" || { err "写入节点数据失败"; return 1; }
+    chmod 600 "$NODES_DB" 2>/dev/null || true
 
     # 重建配置 + 防火墙 + 重启
-    rebuild_config
+    if ! rebuild_config; then
+        sed -i '$d' "$NODES_DB"
+        err "配置重建失败，已撤销新增节点"
+        return 1
+    fi
     open_firewall "$port"
-    restart_xray
+    if ! restart_xray; then
+        warn "配置已保存，但 Xray 未能重启，请检查服务日志"
+        return 1
+    fi
 
     # 生成链接用的 IP 和端口
     local link_ip="${ext_ip:-$default_ip}"
@@ -528,12 +690,21 @@ add_ss() {
     local ext_port=$(echo "$nat_info" | cut -d'|' -f2)
 
     # 写入 nodes.txt（新增 ipver 字段）
-    echo "ss|$port|$method|$password|$remark|$ipver|$ext_ip|$ext_port" >> "$NODES_DB"
+    local node_record="ss|$port|$method|$password|$remark|$ipver|$ext_ip|$ext_port"
+    printf '%s\n' "$node_record" >> "$NODES_DB" || { err "写入节点数据失败"; return 1; }
+    chmod 600 "$NODES_DB" 2>/dev/null || true
 
     # 重建配置 + 防火墙 + 重启
-    rebuild_config
+    if ! rebuild_config; then
+        sed -i '$d' "$NODES_DB"
+        err "配置重建失败，已撤销新增节点"
+        return 1
+    fi
     open_firewall "$port"
-    restart_xray
+    if ! restart_xray; then
+        warn "配置已保存，但 Xray 未能重启，请检查服务日志"
+        return 1
+    fi
 
     # 生成链接用的 IP 和端口
     local link_ip="${ext_ip:-$default_ip}"
@@ -552,6 +723,74 @@ add_ss() {
     echo ""
     echo -e "  客户端链接:"
     echo -e "  ${G}ss://${ss_link}#${remark}${N}"
+    echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+}
+
+# ============================================
+#  添加 HTTP Basic Auth 代理
+# ============================================
+
+add_http() {
+    echo -e "\n${B}━━━ 添加 HTTP Basic Auth 代理 ━━━${N}\n"
+    warn "HTTP 代理不加密客户端到 VPS 的传输，请避免在不可信网络中使用"
+
+    local ip_info=$(choose_ip)
+    local ipver=$(echo "$ip_info" | cut -d'|' -f1)
+    local default_ip=$(echo "$ip_info" | cut -d'|' -f2)
+    local port=$(random_port)
+    local username="proxy_$(openssl rand -hex 8 2>/dev/null)"
+    local password="$(openssl rand -hex 24 2>/dev/null)"
+    local remark=""
+
+    if ! [[ "$username" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || \
+       ! [[ "$password" =~ ^[A-Za-z0-9._-]{32,128}$ ]]; then
+        err "随机 HTTP 凭据生成失败，请确认 openssl 可用"
+        return 1
+    fi
+
+    msg "已分配随机高位端口: $port"
+    msg "已生成随机用户名和强密码"
+
+    read -p "代理备注 [回车默认 HTTP-$port]: " remark
+    remark="${remark:-HTTP-$port}"
+    if ! valid_db_field "$remark"; then
+        err "备注不能为空，也不能包含 | 或换行"
+        return 1
+    fi
+
+    local nat_info=$(read_nat_info)
+    local ext_ip=$(echo "$nat_info" | cut -d'|' -f1)
+    local ext_port=$(echo "$nat_info" | cut -d'|' -f2)
+    local node_record="http|$port|$username|$password|$remark|$ipver|$ext_ip|$ext_port"
+
+    printf '%s\n' "$node_record" >> "$NODES_DB" || { err "写入节点数据失败"; return 1; }
+    chmod 600 "$NODES_DB" 2>/dev/null || true
+
+    if ! rebuild_config; then
+        sed -i '$d' "$NODES_DB"
+        err "配置重建失败，已撤销新增 HTTP 代理"
+        return 1
+    fi
+    open_firewall "$port"
+    if ! restart_xray; then
+        warn "配置已保存，但 Xray 未能重启，请检查服务日志"
+        return 1
+    fi
+
+    local link_ip="${ext_ip:-$default_ip}"
+    local link_port="${ext_port:-$port}"
+    local link_host=$(fmt_host "$link_ip" "$link_port")
+
+    echo ""
+    echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    msg "HTTP 代理创建成功！"
+    echo -e "  IP版本: ${B}IPv${ipver}${N}"
+    echo -e "  主机:   ${B}$link_ip${N}"
+    echo -e "  端口:   ${B}$link_port${N}"
+    echo -e "  用户名: ${B}$username${N}"
+    echo -e "  密码:   ${B}$password${N}"
+    [ -n "$ext_ip" ] && echo -e "  外部:   ${B}$ext_ip:$ext_port → 内部 $port${N}"
+    echo -e "  代理URL: ${G}http://${username}:${password}@${link_host}${N}"
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
 }
 
@@ -602,6 +841,20 @@ list_nodes() {
             echo -e "     端口: $port | 加密: $f3"
             [ -n "$ext_ip" ] && echo -e "     NAT:  $ext_ip:$ext_port → 内部 $port"
             echo -e "     链接: ss://${ss_link}#${f5}"
+        elif [ "$type" = "http" ]; then
+            if [ "$f6" = "4" ] || [ "$f6" = "6" ]; then
+                ipver="$f6"; ext_ip="$f7"; ext_port="$f8"
+            else
+                ext_ip="$f6"; ext_port="$f7"
+            fi
+            link_ip="${ext_ip:-$PUBLIC_IP}"
+            [ "$ipver" = "6" ] && link_ip="${ext_ip:-$PUBLIC_IP6}"
+            link_port="${ext_port:-$port}"
+            local link_host=$(fmt_host "$link_ip" "$link_port")
+            echo -e "  ${G}$i${N}. ${B}[HTTP Basic Auth]${N} $f5 ${Y}(IPv${ipver})${N}"
+            echo -e "     地址: $link_host | 用户名: $f3"
+            [ -n "$ext_ip" ] && echo -e "     NAT:  $ext_ip:$ext_port → 内部 $port"
+            echo -e "     密码: $f4"
         fi
         ((i++))
     done < "$NODES_DB"
@@ -641,9 +894,16 @@ delete_node() {
 
     sed -i "${num}d" "$NODES_DB"
 
-    rebuild_config
+    if ! rebuild_config; then
+        sed -i "${num}i${line}" "$NODES_DB"
+        err "配置重建失败，已恢复节点数据"
+        return 1
+    fi
     close_firewall "$port"
-    restart_xray
+    if ! restart_xray; then
+        warn "节点数据已删除，但 Xray 未能重启，请检查服务日志"
+        return 1
+    fi
     msg "节点已删除"
 }
 
@@ -669,23 +929,35 @@ modify_port() {
 
     local line=$(sed -n "${num}p" "$NODES_DB")
     local old_port=$(echo "$line" | cut -d'|' -f2)
+    local node_type=$(echo "$line" | cut -d'|' -f1)
     local remark=$(echo "$line" | cut -d'|' -f9)
     [ -z "$remark" ] && remark=$(echo "$line" | cut -d'|' -f5)
 
     echo ""
     msg "当前端口: $old_port ($remark)"
-    local new_port=$(read_port)
-
-    # 关闭旧端口防火墙
-    close_firewall "$old_port"
+    local new_port
+    if [ "$node_type" = "http" ]; then
+        new_port=$(random_port)
+        msg "HTTP 代理将使用新的随机高位端口: $new_port"
+    else
+        new_port=$(read_port)
+    fi
 
     # 替换 nodes.txt 中的端口（第2个字段）
     sed -i "${num}s/^[^|]*|[^|]*/$(echo "$line" | cut -d'|' -f1)|${new_port}/" "$NODES_DB"
 
-    # 重建配置 + 开放新端口防火墙 + 重启
-    rebuild_config
+    # 重建配置，成功后再切换防火墙和服务
+    if ! rebuild_config; then
+        sed -i "${num}s/^[^|]*|[^|]*/$(echo "$line" | cut -d'|' -f1)|${old_port}/" "$NODES_DB"
+        err "配置重建失败，已恢复原端口"
+        return 1
+    fi
+    close_firewall "$old_port"
     open_firewall "$new_port"
-    restart_xray
+    if ! restart_xray; then
+        warn "端口数据已更新，但 Xray 未能重启，请检查服务日志"
+        return 1
+    fi
 
     echo ""
     msg "端口已修改: $old_port → $new_port ($remark)"
@@ -725,10 +997,25 @@ export_links() {
                 ext_ip="$f6"; ext_port="$f7"
             fi
             link_ip="${ext_ip:-$PUBLIC_IP}"
+            [ "$f6" = "6" ] && link_ip="${ext_ip:-$PUBLIC_IP6}"
             link_port="${ext_port:-$port}"
             local link_host=$(fmt_host "$link_ip" "$link_port")
             local ss_link=$(printf "%s:%s@%s" "$f3" "$f4" "$link_host" | b64_encode)
             echo "ss://${ss_link}#${f5}"
+        elif [ "$type" = "http" ]; then
+            if [ "$f6" = "4" ] || [ "$f6" = "6" ]; then
+                ext_ip="$f7"; ext_port="$f8"
+            else
+                ext_ip="$f6"; ext_port="$f7"
+            fi
+            link_ip="${ext_ip:-$PUBLIC_IP}"
+            [ "$f6" = "6" ] && link_ip="${ext_ip:-$PUBLIC_IP6}"
+            link_port="${ext_port:-$port}"
+            local link_host=$(fmt_host "$link_ip" "$link_port")
+            echo "HTTP Proxy: ${link_host}"
+            echo "  username: $f3"
+            echo "  password: $f4"
+            echo "  url: http://${f3}:${f4}@${link_host}"
         fi
     done < "$NODES_DB"
 
@@ -1158,31 +1445,33 @@ show_menu() {
     echo -e "${C}"
     echo "╔═══════════════════════════════════════╗"
     echo "║       Xray 节点管理脚本               ║"
-    echo "║   VLESS+Reality / Shadowsocks         ║"
+    echo "║   VLESS / Shadowsocks / HTTP Proxy    ║"
     echo "║   快捷命令: xff                       ║"
     echo "╚═══════════════════════════════════════╝"
     echo -e "${N}"
     echo -e "  ${B}1.${N} 添加 VLESS+Reality 节点"
     echo -e "  ${B}2.${N} 添加 Shadowsocks 节点"
-    echo -e "  ${B}3.${N} 查看所有节点"
-    echo -e "  ${B}4.${N} 删除节点"
-    echo -e "  ${B}5.${N} 修改节点端口"
-    echo -e "  ${B}6.${N} 导出所有链接"
-    echo -e "  ${B}7.${N} 卸载 (清空所有数据)"
-    echo -e "  ${B}8.${N} BBR 加速"
+    echo -e "  ${B}3.${N} 添加 HTTP Basic Auth 代理"
+    echo -e "  ${B}4.${N} 查看所有节点"
+    echo -e "  ${B}5.${N} 删除节点"
+    echo -e "  ${B}6.${N} 修改节点端口"
+    echo -e "  ${B}7.${N} 导出所有链接"
+    echo -e "  ${B}8.${N} 卸载 (清空所有数据)"
+    echo -e "  ${B}9.${N} BBR 加速"
     echo -e "  ${B}0.${N} 退出"
     echo ""
-    read -p "请选择 [0-8]: " choice
+    read -p "请选择 [0-9]: " choice
 
     case $choice in
         1) add_vless ;;
         2) add_ss ;;
-        3) list_nodes ;;
-        4) delete_node ;;
-        5) modify_port ;;
-        6) export_links ;;
-        7) uninstall ;;
-        8) bbr_menu ;;
+        3) add_http ;;
+        4) list_nodes ;;
+        5) delete_node ;;
+        6) modify_port ;;
+        7) export_links ;;
+        8) uninstall ;;
+        9) bbr_menu ;;
         0) echo -e "\n再见！"; exit 0 ;;
         *) warn "无效选择" ;;
     esac
@@ -1199,17 +1488,29 @@ install_shortcut() {
     local script_path="/usr/local/bin/xray-manager.sh"
     local shortcut="/usr/local/bin/xff"
 
-    if [ ! -f "$script_path" ] || ! grep -q "Xray 节点管理" "$script_path" 2>/dev/null; then
-        curl -fsSL --connect-timeout 10 --max-time 60 \
+    if [ ! -f "$script_path" ] || ! grep -q "Feature: http-basic-auth" "$script_path" 2>/dev/null; then
+        local downloaded="${script_path}.download.$$"
+        if curl -fsSL --connect-timeout 10 --max-time 60 \
             "https://raw.githubusercontent.com/masatoshiyokoyama635-sudo/vps-scripts/master/xray-manager.sh" \
-            -o "$script_path" 2>/dev/null || \
-        wget -qO "$script_path" \
-            "https://raw.githubusercontent.com/masatoshiyokoyama635-sudo/vps-scripts/master/xray-manager.sh" 2>/dev/null
-        chmod +x "$script_path"
+            -o "$downloaded" 2>/dev/null && \
+            grep -q "Feature: http-basic-auth" "$downloaded" 2>/dev/null && \
+            bash -n "$downloaded"; then
+            chmod +x "$downloaded"
+            mv -f "$downloaded" "$script_path"
+        else
+            rm -f "$downloaded"
+            warn "未安装包含 HTTP Basic Auth 功能的远程管理脚本"
+            return 1
+        fi
     fi
 
-    if [ ! -L "$shortcut" ] && [ ! -f "$shortcut" ]; then
-        ln -sf "$script_path" "$shortcut"
+    if [ ! -f "$script_path" ] || ! grep -q "Feature: http-basic-auth" "$script_path" 2>/dev/null || ! bash -n "$script_path"; then
+        err "快捷脚本验证失败，未创建 xff"
+        return 1
+    fi
+    chmod +x "$script_path" || return 1
+    if [ ! -e "$shortcut" ]; then
+        ln -sf "$script_path" "$shortcut" || return 1
         msg "快捷命令 xff 已安装，以后输入 xff 即可进入管理"
     fi
 }
@@ -1271,7 +1572,11 @@ main() {
         fi
     fi
 
-    [ ! -f "$NODES_DB" ] && touch "$NODES_DB"
+    if [ ! -f "$NODES_DB" ]; then
+        touch "$NODES_DB" || { err "无法创建节点数据文件"; exit 1; }
+    fi
+    chmod 600 "$NODES_DB" 2>/dev/null || true
+    set_xray_permissions "$XRAY_CONF" || { err "无法设置 Xray 文件权限"; exit 1; }
 
     while true; do
         show_menu
