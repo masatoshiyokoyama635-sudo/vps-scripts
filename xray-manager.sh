@@ -407,7 +407,8 @@ close_firewall() {
 rebuild_config() {
     local config='{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[],"routing":{"domainStrategy":"AsIs","rules":[]}}'
     local v4_tags="[]" v6_tags="[]" seen_ports=""
-    local tmp_conf="${XRAY_CONF}.tmp.$$"
+    # Xray determines the config format from the filename extension; keep .json on the temp file.
+    local tmp_conf="${XRAY_CONF}.tmp.$$.json"
 
     mkdir -p "$(dirname "$XRAY_CONF")" || {
         err "无法创建 Xray 配置目录"

@@ -9,6 +9,7 @@
 - HTTP credentials are now generated automatically: usernames use a random 16-hex suffix and passwords use 24 random hex bytes (48 characters); no manual credential input is required.
 - `bash -n`, `git diff --check`, and Xray 26.3.27 `run -test` against a minimal HTTP configuration passed. Full script rebuild testing is blocked locally because Git Bash does not provide `jq` or Linux `ss`; run the mixed VLESS/SS/HTTP regression on a disposable Linux VPS before deployment.
 - After a VPS with an older Xray rejected the newer `settings.users` HTTP field, switched generation to the backward-compatible `settings.accounts` alias and changed config-test failures to print Xray's actual diagnostic output. Xray 26.3.27 accepts the legacy field.
+- Fixed the temporary config filename suffix: Xray selects JSON format from the filename extension, so validation now uses `${config}.tmp.<pid>.json` instead of a suffix ending in `.tmp`.
 
 ## 2026-06-25
 
