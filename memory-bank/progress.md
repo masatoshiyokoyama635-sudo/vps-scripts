@@ -8,6 +8,7 @@
 - Added HTTP menu/list/export/port-management paths, credential validation, node-data permissions, and a feature marker to prevent `install_shortcut()` from silently installing an older script without HTTP support.
 - HTTP credentials are now generated automatically: usernames use a random 16-hex suffix and passwords use 24 random hex bytes (48 characters); no manual credential input is required.
 - `bash -n`, `git diff --check`, and Xray 26.3.27 `run -test` against a minimal HTTP configuration passed. Full script rebuild testing is blocked locally because Git Bash does not provide `jq` or Linux `ss`; run the mixed VLESS/SS/HTTP regression on a disposable Linux VPS before deployment.
+- After a VPS with an older Xray rejected the newer `settings.users` HTTP field, switched generation to the backward-compatible `settings.accounts` alias and changed config-test failures to print Xray's actual diagnostic output. Xray 26.3.27 accepts the legacy field.
 
 ## 2026-06-25
 

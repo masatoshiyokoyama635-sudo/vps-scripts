@@ -503,7 +503,7 @@ rebuild_config() {
                         --arg tag "$_tag" --arg listen "$_listen" \
                         --arg port "$_port" --arg user "$_f3" --arg password "$_f4" \
                         '{tag:$tag,listen:$listen,port:($port|tonumber),protocol:"http",
-                          settings:{users:[{user:$user,pass:$password}],allowTransparent:false}}') || {
+                          settings:{accounts:[{user:$user,pass:$password}],allowTransparent:false}}') || {
                         err "无法生成 HTTP 配置（nodes.txt 第 ${line_no} 行）"
                         rm -f "$tmp_conf"
                         return 1
@@ -566,10 +566,14 @@ rebuild_config() {
         rm -f "$tmp_conf"
         return 1
     fi
-    if command -v xray >/dev/null 2>&1 && ! xray run -test -config "$tmp_conf" >/dev/null 2>&1; then
-        err "Xray 配置测试失败，保留原配置"
-        rm -f "$tmp_conf"
-        return 1
+    if command -v xray >/dev/null 2>&1; then
+        local xray_test_output=""
+        if ! xray_test_output=$(xray run -test -config "$tmp_conf" 2>&1); then
+            err "Xray 配置测试失败，保留原配置"
+            [ -n "$xray_test_output" ] && printf '%s\n' "$xray_test_output" >&2
+            rm -f "$tmp_conf"
+            return 1
+        fi
     fi
     chmod 600 "$tmp_conf" || {
         err "无法设置 Xray 配置权限"
