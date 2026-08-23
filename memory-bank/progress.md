@@ -1,5 +1,10 @@
 # Progress
 
+## 2026-08-23
+
+- Unified HTTP proxy port selection with VLESS and Shadowsocks: users can enter a specific available port, while pressing Enter accepts the displayed random high-port default.
+- Removed the HTTP-only forced-random behavior from both proxy creation and node port modification; HTTP credentials remain automatically generated.
+
 ## 2026-08-16
 
 - Added persistent HTTP Basic Auth inbound support to `xray-manager.sh` while retaining VLESS Reality and Shadowsocks.

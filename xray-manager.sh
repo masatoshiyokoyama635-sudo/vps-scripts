@@ -742,7 +742,7 @@ add_http() {
     local ip_info=$(choose_ip)
     local ipver=$(echo "$ip_info" | cut -d'|' -f1)
     local default_ip=$(echo "$ip_info" | cut -d'|' -f2)
-    local port=$(random_port)
+    local port=$(read_port)
     local username="proxy_$(openssl rand -hex 8 2>/dev/null)"
     local password="$(openssl rand -hex 24 2>/dev/null)"
     local remark=""
@@ -753,7 +753,6 @@ add_http() {
         return 1
     fi
 
-    msg "已分配随机高位端口: $port"
     msg "已生成随机用户名和强密码"
 
     read -p "代理备注 [回车默认 HTTP-$port]: " remark
@@ -934,19 +933,12 @@ modify_port() {
 
     local line=$(sed -n "${num}p" "$NODES_DB")
     local old_port=$(echo "$line" | cut -d'|' -f2)
-    local node_type=$(echo "$line" | cut -d'|' -f1)
     local remark=$(echo "$line" | cut -d'|' -f9)
     [ -z "$remark" ] && remark=$(echo "$line" | cut -d'|' -f5)
 
     echo ""
     msg "当前端口: $old_port ($remark)"
-    local new_port
-    if [ "$node_type" = "http" ]; then
-        new_port=$(random_port)
-        msg "HTTP 代理将使用新的随机高位端口: $new_port"
-    else
-        new_port=$(read_port)
-    fi
+    local new_port=$(read_port)
 
     # 替换 nodes.txt 中的端口（第2个字段）
     sed -i "${num}s/^[^|]*|[^|]*/$(echo "$line" | cut -d'|' -f1)|${new_port}/" "$NODES_DB"
