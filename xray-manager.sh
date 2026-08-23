@@ -5,13 +5,13 @@
 #   支持: VLESS+Reality+TCP / Shadowsocks / HTTP Basic Auth
 #   支持: NAT 小鸡
 #   支持: BBR 加速
-#   Feature: http-basic-auth
+#   Feature: http-basic-auth-manual-port
 # ============================================
 
 # ---- 配置 ----
 XRAY_CONF="/usr/local/etc/xray/config.json"
 NODES_DB="/usr/local/etc/xray/nodes.txt"
-SCRIPT_FEATURE="http-basic-auth"
+SCRIPT_FEATURE="http-basic-auth-manual-port"
 PUBLIC_IP=""
 PUBLIC_IP6=""
 NAT_MODE=false
@@ -1484,13 +1484,14 @@ show_menu() {
 install_shortcut() {
     local script_path="/usr/local/bin/xray-manager.sh"
     local shortcut="/usr/local/bin/xff"
+    local feature_marker="Feature: ${SCRIPT_FEATURE}"
 
-    if [ ! -f "$script_path" ] || ! grep -q "Feature: http-basic-auth" "$script_path" 2>/dev/null; then
+    if [ ! -f "$script_path" ] || ! grep -Fq "$feature_marker" "$script_path" 2>/dev/null; then
         local downloaded="${script_path}.download.$$"
         if curl -fsSL --connect-timeout 10 --max-time 60 \
-            "https://raw.githubusercontent.com/masatoshiyokoyama635-sudo/vps-scripts/master/xray-manager.sh" \
+            "https://raw.githubusercontent.com/masatoshiyokoyama635-sudo/vps-scripts/refs/heads/master/xray-manager.sh" \
             -o "$downloaded" 2>/dev/null && \
-            grep -q "Feature: http-basic-auth" "$downloaded" 2>/dev/null && \
+            grep -Fq "$feature_marker" "$downloaded" 2>/dev/null && \
             bash -n "$downloaded"; then
             chmod +x "$downloaded"
             mv -f "$downloaded" "$script_path"
@@ -1501,7 +1502,7 @@ install_shortcut() {
         fi
     fi
 
-    if [ ! -f "$script_path" ] || ! grep -q "Feature: http-basic-auth" "$script_path" 2>/dev/null || ! bash -n "$script_path"; then
+    if [ ! -f "$script_path" ] || ! grep -Fq "$feature_marker" "$script_path" 2>/dev/null || ! bash -n "$script_path"; then
         err "快捷脚本验证失败，未创建 xff"
         return 1
     fi

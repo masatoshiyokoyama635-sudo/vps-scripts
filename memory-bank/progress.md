@@ -4,6 +4,7 @@
 
 - Unified HTTP proxy port selection with VLESS and Shadowsocks: users can enter a specific available port, while pressing Enter accepts the displayed random high-port default.
 - Removed the HTTP-only forced-random behavior from both proxy creation and node port modification; HTTP credentials remain automatically generated.
+- Bumped the feature marker to `http-basic-auth-manual-port` and made `install_shortcut()` validate against `SCRIPT_FEATURE`, so an existing `xff` installation with the old forced-random behavior is refreshed from the explicit `refs/heads/master` raw URL.
 
 ## 2026-08-16
 
